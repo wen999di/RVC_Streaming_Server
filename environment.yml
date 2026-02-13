@@ -1,0 +1,20 @@
+name: RVC
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pytorch=2.5.1
+  - faiss-gpu
+  - scipy
+  - librosa
+  - websockets
+  - fairseq
+  - pip:
+      - --index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+      - pyworld
+      - praat-parselmouth
+      - soundfile
