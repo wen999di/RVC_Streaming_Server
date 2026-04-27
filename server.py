@@ -301,6 +301,59 @@ async def binary_echo_handler(websocket):
     last_backlog_log_ts = 0.0
     empty_out_streak = 0
     last_empty_out_log_ts = 0.0
+
+    def _abs_voice_model_path(filename: str) -> str:
+        base = os.path.basename(str(filename or ""))
+        if not base:
+            return ""
+        return str((upload_manager.files_dir / base).resolve())
+
+    def _attach_voice_runtime_state(voice: dict) -> dict:
+        out = dict(voice or {})
+        models = out.get("models") if isinstance(out.get("models"), list) else []
+
+        inferer = getattr(getattr(processor, "core", None), "_inferer", None)
+        loaded_paths = set()
+        last_unloaded_path = ""
+        try:
+            if inferer is not None:
+                loaded_paths = {str(Path(p).resolve()) for p in inferer.get_loaded_model_paths()}
+                last_unloaded_path = str(getattr(inferer, "last_unloaded_model_path", "") or "")
+                if last_unloaded_path:
+                    last_unloaded_path = str(Path(last_unloaded_path).resolve())
+        except Exception:
+            loaded_paths = set()
+            last_unloaded_path = ""
+
+        out_models = []
+        last_unloaded_id = ""
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            item = dict(m)
+            full_path = _abs_voice_model_path(item.get("pth", ""))
+            item["loaded"] = bool(full_path and full_path in loaded_paths)
+            if full_path and last_unloaded_path and full_path == last_unloaded_path:
+                last_unloaded_id = str(item.get("id") or "")
+            out_models.append(item)
+
+        out["models"] = out_models
+        out["last_unloaded_id"] = last_unloaded_id
+        return out
+
+    async def _send_voice_models() -> None:
+        voice = await asyncio.to_thread(model_registry.list_voice_models)
+        voice = _attach_voice_runtime_state(voice)
+        await websocket.send(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "type": "voice_models",
+                    "voice": voice,
+                }
+            )
+        )
+
     try:
         async for message in websocket:
             # 根据消息类型进行处理
@@ -752,16 +805,7 @@ async def binary_echo_handler(websocket):
 
                     elif "command" in data and data["command"] == "voice_model_list":
                         try:
-                            voice = await asyncio.to_thread(model_registry.list_voice_models)
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "status": "ok",
-                                        "type": "voice_models",
-                                        "voice": voice,
-                                    }
-                                )
-                            )
+                            await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Voice Model List Error: {e}", exc_info=True)
                             await websocket.send(
@@ -779,22 +823,14 @@ async def binary_echo_handler(websocket):
                             name = data.get("name", "")
                             pth = data.get("pth", "")
                             index = data.get("index", "")
-                            voice = await asyncio.to_thread(
+                            await asyncio.to_thread(
                                 model_registry.add_voice_model,
                                 name=name,
                                 pth=pth,
                                 index=index,
                                 files_dir=upload_manager.files_dir,
                             )
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "status": "ok",
-                                        "type": "voice_models",
-                                        "voice": voice,
-                                    }
-                                )
-                            )
+                            await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Voice Model Add Error: {e}", exc_info=True)
                             await websocket.send(
@@ -810,18 +846,10 @@ async def binary_echo_handler(websocket):
                     elif "command" in data and data["command"] == "voice_model_activate":
                         try:
                             model_id = data.get("id", "")
-                            voice = await asyncio.to_thread(
+                            await asyncio.to_thread(
                                 model_registry.activate_voice_model, model_id=model_id
                             )
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "status": "ok",
-                                        "type": "voice_models",
-                                        "voice": voice,
-                                    }
-                                )
-                            )
+                            await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Voice Model Activate Error: {e}", exc_info=True)
                             await websocket.send(
@@ -837,20 +865,49 @@ async def binary_echo_handler(websocket):
                     elif "command" in data and data["command"] == "voice_model_remove":
                         try:
                             model_id = data.get("id", "")
-                            voice = await asyncio.to_thread(
+                            await asyncio.to_thread(
                                 model_registry.remove_voice_model, model_id=model_id
                             )
+                            await _send_voice_models()
+                        except Exception as e:
+                            logging.error(f"Voice Model Remove Error: {e}", exc_info=True)
                             await websocket.send(
                                 json.dumps(
                                     {
-                                        "status": "ok",
-                                        "type": "voice_models",
-                                        "voice": voice,
+                                        "status": "error",
+                                        "type": "voice_model_error",
+                                        "message": str(e),
                                     }
                                 )
                             )
+
+                    elif "command" in data and data["command"] == "voice_model_preload":
+                        try:
+                            model_id = str(data.get("id", "") or "").strip()
+                            if not model_id:
+                                raise ValueError("invalid_model_id")
+
+                            voice = await asyncio.to_thread(model_registry.list_voice_models)
+                            models = voice.get("models") if isinstance(voice.get("models"), list) else []
+                            model_item = next(
+                                (
+                                    m
+                                    for m in models
+                                    if isinstance(m, dict) and str(m.get("id") or "") == model_id
+                                ),
+                                None,
+                            )
+                            if model_item is None:
+                                raise ValueError("unknown_voice_model")
+
+                            model_pth = _abs_voice_model_path(model_item.get("pth", ""))
+                            if not model_pth or not os.path.exists(model_pth):
+                                raise FileNotFoundError("file_not_found_pth")
+
+                            await asyncio.to_thread(processor.core.preload_voice_model, model_pth)
+                            await _send_voice_models()
                         except Exception as e:
-                            logging.error(f"Voice Model Remove Error: {e}", exc_info=True)
+                            logging.error(f"Voice Model Preload Error: {e}", exc_info=True)
                             await websocket.send(
                                 json.dumps(
                                     {

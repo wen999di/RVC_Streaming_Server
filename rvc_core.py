@@ -124,6 +124,9 @@ class RVCCore:
     def warmup(self):
         return self._inferer.warmup(f0method=self.f0_method)
 
+    def preload_voice_model(self, model_path: str):
+        return self._inferer.preload_model(model_path)
+
     def process_frame(self, audio_bytes_f32, ts_start_ns=None):
         if not audio_bytes_f32:
             return b"", None

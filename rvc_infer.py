@@ -2,6 +2,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from collections import OrderedDict
 from typing import Optional
 import numpy as np
 import torch
@@ -89,6 +90,8 @@ class RealtimeRVCInferer:
         self._hubert: Optional[torch.nn.Module] = None
         self._net_g: Optional[torch.nn.Module] = None
         self._info: Optional[LoadedModelInfo] = None
+        self._net_g_cache: "OrderedDict[str, tuple[torch.nn.Module, LoadedModelInfo]]" = OrderedDict()
+        self._last_unloaded_model_path: str = ""
  
         self._faiss_index = None
         self._faiss_big_npy = None
@@ -109,6 +112,13 @@ class RealtimeRVCInferer:
     @property
     def info(self) -> Optional[LoadedModelInfo]:
         return self._info
+
+    @property
+    def last_unloaded_model_path(self) -> str:
+        return self._last_unloaded_model_path
+
+    def get_loaded_model_paths(self) -> list[str]:
+        return list(self._net_g_cache.keys())
  
     def configure(
         self,
@@ -136,8 +146,6 @@ class RealtimeRVCInferer:
 
         if model_path != self._model_path:
             self._model_path = model_path
-            self._net_g = None
-            self._info = None
             self._cache_pitch.zero_()
             self._cache_pitchf.zero_()
 
@@ -191,79 +199,9 @@ class RealtimeRVCInferer:
         if not self._model_path:
             raise RuntimeError("缺少 model_path")
 
-        if self._hubert is None:
-            hubert_path = self._hubert_path
-            # 如果未指定 hubert_path，尝试默认路径
-            if not hubert_path:
-                files_dir = Path(__file__).parent / "files"
-                alt_hubert = files_dir / "hubert_base.pt"
-                if alt_hubert.exists():
-                    hubert_path = str(alt_hubert)
-            
-            if not os.path.exists(hubert_path):
-                 # 如果仍然找不到，尝试在 server/files 下找传入的文件名(如果是纯文件名)
-                 if self._hubert_path and not os.path.isabs(self._hubert_path):
-                     files_dir = Path(__file__).parent / "files"
-                     alt = files_dir / self._hubert_path
-                     if alt.exists():
-                         hubert_path = str(alt)
-            
-            if not os.path.exists(hubert_path):
-                 raise FileNotFoundError(f"找不到 HuBERT 权重：{hubert_path}")
+        self._ensure_hubert_loaded()
+        self._ensure_active_model_loaded()
 
-            self._hubert = _load_hubert(self.device, self.is_half, hubert_path)
-
-        if self._net_g is None or self._info is None:
-            if not os.path.exists(self._model_path):
-                raise FileNotFoundError(f"找不到音色模型：{self._model_path}")
-
-            # 内联模型加载逻辑，不依赖 infer.lib.jit.get_synthesizer
-            from models import (
-                SynthesizerTrnMs256NSFsid,
-                SynthesizerTrnMs256NSFsid_nono,
-                SynthesizerTrnMs768NSFsid,
-                SynthesizerTrnMs768NSFsid_nono,
-            )
-
-            load_map_location = self.device if self.device.type == "cuda" else "cpu"
-            try:
-                try:
-                    cpt = torch.load(self._model_path, map_location=load_map_location, weights_only=False)
-                except TypeError:
-                    cpt = torch.load(self._model_path, map_location=load_map_location)
-            except RuntimeError as e:
-                if self.device.type == "cuda" and "out of memory" in str(e).lower():
-                    try:
-                        cpt = torch.load(self._model_path, map_location="cpu", weights_only=False)
-                    except TypeError:
-                        cpt = torch.load(self._model_path, map_location="cpu")
-                else:
-                    raise
-            tgt_sr = cpt["config"][-1]
-            cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
-            if_f0 = cpt.get("f0", 1)
-            version = cpt.get("version", "v1")
-
-            if version == "v1":
-                if if_f0 == 1:
-                    net_g = SynthesizerTrnMs256NSFsid(*cpt["config"], is_half=self.is_half)
-                else:
-                    net_g = SynthesizerTrnMs256NSFsid_nono(*cpt["config"])
-            elif version == "v2":
-                if if_f0 == 1:
-                    net_g = SynthesizerTrnMs768NSFsid(*cpt["config"], is_half=self.is_half)
-                else:
-                    net_g = SynthesizerTrnMs768NSFsid_nono(*cpt["config"])
-            
-            del net_g.enc_q
-            net_g = net_g.to(self.device)
-            net_g = net_g.half() if self.is_half else net_g.float()
-            net_g.load_state_dict(cpt["weight"], strict=False)
-            net_g.eval()
-            
-            self._net_g = net_g
-            self._info = LoadedModelInfo(tgt_sr=tgt_sr, if_f0=if_f0, version=version)
- 
         if self._index_rate > 0.0 and self._index_path:
             if self._faiss_index is None:
                 import faiss
@@ -271,7 +209,7 @@ class RealtimeRVCInferer:
                     raise FileNotFoundError(f"找不到 index：{self._index_path}")
                 index = faiss.read_index(self._index_path)
                 big_npy = index.reconstruct_n(0, index.ntotal)
-                
+
                 if self.device.type == "cuda":
                     try:
                         res = faiss.StandardGpuResources()
@@ -283,6 +221,182 @@ class RealtimeRVCInferer:
                 self._faiss_big_npy = big_npy
                 if self.device.type == "cuda" and isinstance(self._faiss_big_npy, np.ndarray):
                     self._faiss_big_npy = torch.from_numpy(self._faiss_big_npy).to(self.device)
+
+    def preload_model(self, model_path: str) -> dict:
+        model_path = str(model_path or "")
+        if not model_path:
+            raise RuntimeError("缺少 model_path")
+
+        self._ensure_hubert_loaded()
+        evicted_paths: list[str] = []
+
+        if model_path in self._net_g_cache:
+            self._activate_cached_model(model_path)
+            return {
+                "loaded_paths": self.get_loaded_model_paths(),
+                "evicted_paths": evicted_paths,
+            }
+
+        while True:
+            try:
+                net_g, info = self._load_net_g_from_path(model_path)
+                self._net_g_cache[model_path] = (net_g, info)
+                self._net_g_cache.move_to_end(model_path)
+                break
+            except RuntimeError as e:
+                if self.device.type == "cuda" and "out of memory" in str(e).lower():
+                    evicted = self._evict_one_cached_model(keep_path=self._model_path)
+                    if not evicted:
+                        raise
+                    evicted_paths.append(evicted)
+                    continue
+                raise
+
+        if model_path == self._model_path:
+            self._activate_cached_model(model_path)
+
+        return {
+            "loaded_paths": self.get_loaded_model_paths(),
+            "evicted_paths": evicted_paths,
+        }
+
+    def _ensure_hubert_loaded(self) -> None:
+        if self._hubert is not None:
+            return
+
+        hubert_path = self._hubert_path
+        if not hubert_path:
+            files_dir = Path(__file__).parent / "files"
+            alt_hubert = files_dir / "hubert_base.pt"
+            if alt_hubert.exists():
+                hubert_path = str(alt_hubert)
+
+        if not os.path.exists(hubert_path):
+            if self._hubert_path and not os.path.isabs(self._hubert_path):
+                files_dir = Path(__file__).parent / "files"
+                alt = files_dir / self._hubert_path
+                if alt.exists():
+                    hubert_path = str(alt)
+
+        if not os.path.exists(hubert_path):
+            raise FileNotFoundError(f"找不到 HuBERT 权重：{hubert_path}")
+
+        self._hubert = _load_hubert(self.device, self.is_half, hubert_path)
+
+    def _ensure_active_model_loaded(self) -> None:
+        if self._model_path in self._net_g_cache:
+            self._activate_cached_model(self._model_path)
+            return
+
+        while True:
+            try:
+                net_g, info = self._load_net_g_from_path(self._model_path)
+                self._net_g_cache[self._model_path] = (net_g, info)
+                self._net_g_cache.move_to_end(self._model_path)
+                self._activate_cached_model(self._model_path)
+                return
+            except RuntimeError as e:
+                if self.device.type == "cuda" and "out of memory" in str(e).lower():
+                    evicted = self._evict_one_cached_model(keep_path=self._model_path)
+                    if not evicted:
+                        raise
+                    continue
+                raise
+
+    def _activate_cached_model(self, model_path: str) -> None:
+        net_g, info = self._net_g_cache[model_path]
+        self._net_g = net_g
+        self._info = info
+        self._net_g_cache.move_to_end(model_path)
+
+    def _evict_one_cached_model(self, keep_path: str = "") -> str:
+        if not self._net_g_cache:
+            return ""
+
+        victim_path = ""
+        for path in self._net_g_cache.keys():
+            if keep_path and path == keep_path:
+                continue
+            victim_path = path
+            break
+
+        if not victim_path:
+            if keep_path in self._net_g_cache and len(self._net_g_cache) == 1:
+                return ""
+            victim_path = next(iter(self._net_g_cache.keys()))
+
+        victim_net, _ = self._net_g_cache.pop(victim_path)
+        try:
+            victim_net.to("cpu")
+        except Exception:
+            pass
+        del victim_net
+
+        if self._net_g is not None and victim_path == self._model_path:
+            self._net_g = None
+            self._info = None
+
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        self._last_unloaded_model_path = victim_path
+        return victim_path
+
+    def _load_net_g_from_path(self, model_path: str) -> tuple[torch.nn.Module, LoadedModelInfo]:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"找不到音色模型：{model_path}")
+
+        from models import (
+            SynthesizerTrnMs256NSFsid,
+            SynthesizerTrnMs256NSFsid_nono,
+            SynthesizerTrnMs768NSFsid,
+            SynthesizerTrnMs768NSFsid_nono,
+        )
+
+        load_map_location = self.device if self.device.type == "cuda" else "cpu"
+        try:
+            try:
+                cpt = torch.load(model_path, map_location=load_map_location, weights_only=False)
+            except TypeError:
+                cpt = torch.load(model_path, map_location=load_map_location)
+        except RuntimeError as e:
+            if self.device.type == "cuda" and "out of memory" in str(e).lower():
+                try:
+                    cpt = torch.load(model_path, map_location="cpu", weights_only=False)
+                except TypeError:
+                    cpt = torch.load(model_path, map_location="cpu")
+            else:
+                raise
+
+        tgt_sr = cpt["config"][-1]
+        cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
+        if_f0 = cpt.get("f0", 1)
+        version = cpt.get("version", "v1")
+
+        if version == "v1":
+            if if_f0 == 1:
+                net_g = SynthesizerTrnMs256NSFsid(*cpt["config"], is_half=self.is_half)
+            else:
+                net_g = SynthesizerTrnMs256NSFsid_nono(*cpt["config"])
+        elif version == "v2":
+            if if_f0 == 1:
+                net_g = SynthesizerTrnMs768NSFsid(*cpt["config"], is_half=self.is_half)
+            else:
+                net_g = SynthesizerTrnMs768NSFsid_nono(*cpt["config"])
+        else:
+            raise RuntimeError(f"未知模型版本: {version}")
+
+        del net_g.enc_q
+        net_g = net_g.to(self.device)
+        net_g = net_g.half() if self.is_half else net_g.float()
+        net_g.load_state_dict(cpt["weight"], strict=False)
+        net_g.eval()
+
+        info = LoadedModelInfo(tgt_sr=tgt_sr, if_f0=if_f0, version=version)
+        return net_g, info
 
     def _get_f0_post(self, f0) -> tuple[torch.Tensor, torch.Tensor]:
         if not torch.is_tensor(f0):
