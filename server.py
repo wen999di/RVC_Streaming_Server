@@ -243,43 +243,13 @@ async def binary_echo_handler(websocket):
     outgoing_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=12)
 
     async def sender_loop():
-        next_deadline = time.perf_counter()
-
+        # 无节拍发送：有包即发，不人为延迟。
+        # 推理块产生 12 个 chunk 后瞬间入队，sender 尽可能快地发给客户端。
+        # TCP 协议栈和客户端 JitterEstimator（MaxBufferMs=250）负责吸收块间间隙。
         while True:
-            stream_chunk_ms = int(processor.config.get("stream_chunk_ms", 20) or 20)
-            if stream_chunk_ms <= 0:
-                stream_chunk_ms = 20
-            interval_s = stream_chunk_ms / 1000.0
-
-            # 队列积压阈值：约 80ms 的数据量（4 包@20ms）
-            burst_threshold = max(2, int(80 / stream_chunk_ms))
-            q_size = outgoing_queue.qsize()
-
-            # 等待队列中有数据
-            try:
-                item = await asyncio.wait_for(outgoing_queue.get(), timeout=0.050)
-            except asyncio.TimeoutError:
-                continue
-
+            item = await outgoing_queue.get()
             proc_time, enqueue_time, ts_ns, payload_chunk = item
 
-            now = time.perf_counter()
-
-            if q_size <= burst_threshold:
-                # 正常模式：按 stream_chunk_ms 节拍发送
-                if now < next_deadline:
-                    await asyncio.sleep(next_deadline - now)
-                    now = time.perf_counter()
-                if now > next_deadline + 1.0:
-                    next_deadline = now
-                next_deadline += interval_s
-            else:
-                # 追赶模式：以 3 倍速发送（约 7ms/包），快速降低队列但不瞬间清空
-                # 这样客户端有足够时间让 JitterEstimator 检测到 IAT 变化
-                await asyncio.sleep(interval_s / 3)
-                next_deadline = now + interval_s
-
-            # 计算队列等待时间
             queue_wait_ms = int((time.perf_counter() - enqueue_time) * 1000)
             if queue_wait_ms > 65535:
                 queue_wait_ms = 65535
