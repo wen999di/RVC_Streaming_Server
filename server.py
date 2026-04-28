@@ -238,57 +238,48 @@ async def binary_echo_handler(websocket):
     logging.info("Audio Processor Initialized (waiting for client config)")
 
     loop = asyncio.get_running_loop()
-    # 出站队列容量 35（约 700ms@20ms/chunk），用于吸收接收速率波动。
+    # 出站队列容量 8（约 160ms@20ms/chunk），用于吸收接收速率波动。
+    # 小队列防止推理突发输出在服务端过度堆积。
     # outgoing_queue: (proc_time_ms, enqueue_time_s, ts_ns, audio_chunk)
-    outgoing_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=35)
+    outgoing_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=8)
 
     async def sender_loop():
         next_deadline = time.perf_counter()
-        
+
         while True:
             stream_chunk_ms = int(processor.config.get("stream_chunk_ms", 20) or 20)
             if stream_chunk_ms <= 0:
                 stream_chunk_ms = 20
             interval_s = stream_chunk_ms / 1000.0
 
-            # 策略：队列积压较大时开启“追赶模式”（Burst Mode）。
-            # 阈值设为 约 100ms 的数据量
-            burst_threshold = max(1, int(100 / stream_chunk_ms))
-            q_size = outgoing_queue.qsize()
-            
-            now = time.perf_counter()
-            
-            # 如果积压 > 阈值，跳过 sleep 直接发送，直到积压消除
-            if q_size <= burst_threshold:
-                if now < next_deadline:
-                    await asyncio.sleep(next_deadline - now)
-                
-                # 只有在极大延迟（如断网重连后）才重置 deadline，避免时间漂移
-                # 允许 1秒 的时间债，超过 1秒 才重置，保证长期平均速率匹配
-                if now > next_deadline + 1.0:
-                    next_deadline = now
-                
-                next_deadline += interval_s
-            else:
-                # Burst mode: 不等待，快速消耗队列以降低延迟
-                # 让出一点 CPU 时间片
-                await asyncio.sleep(0)
-                # 在追赶模式下，我们将 deadline 重置为当前，以便追赶结束后重新按节奏发送
-                next_deadline = time.perf_counter() + interval_s
-
+            # 等待队列中有数据（超时避免永久阻塞，同时允许动态读取 stream_chunk_ms）
             try:
-                item = outgoing_queue.get_nowait()
-                proc_time, enqueue_time, ts_ns, payload_chunk = item
-                
-                # 计算队列等待时间
-                queue_wait_ms = int((time.perf_counter() - enqueue_time) * 1000)
-                if queue_wait_ms > 65535: queue_wait_ms = 65535
-                
-                header = struct.pack('>HHQ', proc_time, queue_wait_ms, int(ts_ns))
-                final_payload = header + payload_chunk
-                
-            except asyncio.QueueEmpty:
+                item = await asyncio.wait_for(outgoing_queue.get(), timeout=0.100)
+            except asyncio.TimeoutError:
                 continue
+
+            proc_time, enqueue_time, ts_ns, payload_chunk = item
+
+            now = time.perf_counter()
+
+            # 恒定节拍发送（不区分 burst/pace，避免客户端收到突发包后出现长间隙导致 underrun）
+            if now < next_deadline:
+                await asyncio.sleep(next_deadline - now)
+                now = time.perf_counter()
+
+            # 如果落后超过 2 个间隔（> 40ms），重置 deadline 避免不必要的追赶延迟
+            if now > next_deadline + 2 * interval_s:
+                next_deadline = now
+
+            next_deadline += interval_s
+
+            # 计算队列等待时间
+            queue_wait_ms = int((time.perf_counter() - enqueue_time) * 1000)
+            if queue_wait_ms > 65535:
+                queue_wait_ms = 65535
+
+            header = struct.pack('>HHQ', proc_time, queue_wait_ms, int(ts_ns))
+            final_payload = header + payload_chunk
 
             try:
                 await websocket.send(final_payload)
@@ -1131,21 +1122,20 @@ async def binary_echo_handler(websocket):
                     # 记录入队时间，用于计算在输出队列中的等待时间
                     enqueue_time = time.perf_counter()
                     
-                    # 队列满时丢弃旧包
-                    while outgoing_queue.full():
-                        try:
-                            outgoing_queue.get_nowait()
-                            outgoing_queue.task_done()
-                        except asyncio.QueueEmpty:
-                            break
+                    # 使用阻塞 put，让 sender 的发包节奏自然反压推理输出速率
+                    # 队列小（maxsize=8），不会长时间阻塞
                     try:
-                        outgoing_queue.put_nowait((out_proc, enqueue_time, chunk_ts_ns, chunk))
-                    except asyncio.QueueFull:
-                        pass
+                        await asyncio.wait_for(
+                            outgoing_queue.put((out_proc, enqueue_time, chunk_ts_ns, chunk)),
+                            timeout=2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logging.warning("输出队列阻塞超过 2s，丢弃音频块")
+                        break
                 
-                # 队列积压监控（阈值调整为 25，容量 35 的 ~70%）
+                # 队列积压监控（阈值为 6，容量 8 的 75%）
                 queue_size = outgoing_queue.qsize()
-                if queue_size > 25:
+                if queue_size > 6:
                     now = time.perf_counter()
                     if now - last_backlog_log_ts > 5.0:
                         logging.warning(f"输出队列积压: {queue_size} 包")
