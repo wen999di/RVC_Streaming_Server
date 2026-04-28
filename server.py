@@ -238,9 +238,11 @@ async def binary_echo_handler(websocket):
     logging.info("Audio Processor Initialized (waiting for client config)")
 
     loop = asyncio.get_running_loop()
-    # 出站队列容量 12（约 240ms@20ms/chunk），刚好容纳一个推理块的输出。
+    # 出站队列容量：需容纳单个推理块的全部输出 chunk。
+    # chunk_bytes=stream_chunk_ms*output_sr*bytes/1000 (典型 1280), block_frame 最大约 64000 字节。
+    # ceil(64000/1280) + 余量 = 50 + 5 = 55。使用 60 确保不溢出丢弃。
     # outgoing_queue: (proc_time_ms, enqueue_time_s, ts_ns, audio_chunk)
-    outgoing_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=12)
+    outgoing_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=60)
 
     async def sender_loop():
         # 无节拍发送：有包即发，不人为延迟。
@@ -1110,9 +1112,9 @@ async def binary_echo_handler(websocket):
                     except asyncio.QueueFull:
                         pass
                 
-                # 队列积压监控（阈值为 9，容量 12 的 75%）
+                # 队列积压监控（阈值 45，容量 60 的 75%）
                 queue_size = outgoing_queue.qsize()
-                if queue_size > 9:
+                if queue_size > 45:
                     now = time.perf_counter()
                     if now - last_backlog_log_ts > 5.0:
                         logging.warning(f"输出队列积压: {queue_size} 包")
