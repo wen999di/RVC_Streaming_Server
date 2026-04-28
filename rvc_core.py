@@ -133,11 +133,6 @@ class RVCCore:
         if ts_start_ns is None:
             ts_start_ns = 0
 
-        # Passthrough 模式：即时回传，不累积 block_frame。
-        # 每个 WebSocket 消息（~20ms）立刻原样返回，消除 burst-gap 模式。
-        if self.passthrough:
-            return audio_bytes_f32, int(ts_start_ns)
-
         self._push_input_segment(audio_bytes_f32, int(ts_start_ns))
 
         if self.pending_samples < self.block_frame:
