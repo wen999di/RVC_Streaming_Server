@@ -245,25 +245,40 @@ async def binary_echo_handler(websocket):
 
     async def sender_loop():
         # 无节拍发送：有包即发，不人为延迟。
-        # 推理块产生 12 个 chunk 后瞬间入队，sender 尽可能快地发给客户端。
-        # TCP 协议栈和客户端 JitterEstimator（MaxBufferMs=250）负责吸收块间间隙。
+        send_count = 0
+        last_diag_time = time.perf_counter()
         while True:
-            item = await outgoing_queue.get()
-            proc_time, enqueue_time, ts_ns, payload_chunk = item
-
-            queue_wait_ms = int((time.perf_counter() - enqueue_time) * 1000)
-            if queue_wait_ms > 65535:
-                queue_wait_ms = 65535
-
-            header = struct.pack('>HHQ', proc_time, queue_wait_ms, int(ts_ns))
-            final_payload = header + payload_chunk
-
             try:
-                await websocket.send(final_payload)
-            except Exception as e:
-                logging.error(f"发送失败: {e}")
-            finally:
-                outgoing_queue.task_done()
+                item = await outgoing_queue.get()
+                proc_time, enqueue_time, ts_ns, payload_chunk = item
+
+                queue_wait_ms = int((time.perf_counter() - enqueue_time) * 1000)
+                if queue_wait_ms > 65535:
+                    queue_wait_ms = 65535
+
+                header = struct.pack('>HHQ', proc_time, queue_wait_ms, int(ts_ns))
+                final_payload = header + payload_chunk
+
+                try:
+                    await websocket.send(final_payload)
+                except Exception as e:
+                    logging.error(f"发送失败: {e}")
+                finally:
+                    outgoing_queue.task_done()
+
+                send_count += 1
+                now = time.perf_counter()
+                if now - last_diag_time > 10.0:
+                    qs = outgoing_queue.qsize()
+                    logging.info(f"sender 诊断: 10s 内发送 {send_count} 包, 当前队列 {qs}, 队列等待 {queue_wait_ms}ms")
+                    send_count = 0
+                    last_diag_time = now
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.exception(f"sender_loop 异常，尝试恢复: {exc}")
+                await asyncio.sleep(0.1)
 
     sender_task = asyncio.create_task(sender_loop())
     last_backlog_log_ts = 0.0
@@ -1098,18 +1113,11 @@ async def binary_echo_handler(websocket):
                     
                     # 记录入队时间，用于计算在输出队列中的等待时间
                     enqueue_time = time.perf_counter()
-                    
-                    # 队列满时丢弃最旧包（queue=12 恰好容纳一个 250ms 块的输出，正常不应溢出）
-                    while outgoing_queue.full():
-                        try:
-                            outgoing_queue.get_nowait()
-                            outgoing_queue.task_done()
-                        except asyncio.QueueEmpty:
-                            break
-                    try:
-                        outgoing_queue.put_nowait((out_proc, enqueue_time, chunk_ts_ns, chunk))
-                    except asyncio.QueueFull:
-                        pass
+
+                    # 使用 await put() 而非 put_nowait()：
+                    # 1. 自然 yield 给事件循环，让 sender 有机会运行
+                    # 2. 队列满(128)时背压推理输出，而非丢弃音频
+                    await outgoing_queue.put((out_proc, enqueue_time, chunk_ts_ns, chunk))
                 
                 # 队列积压监控（阈值 96，容量 128 的 75%）
                 queue_size = outgoing_queue.qsize()
