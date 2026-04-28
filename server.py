@@ -238,10 +238,9 @@ async def binary_echo_handler(websocket):
     logging.info("Audio Processor Initialized (waiting for client config)")
 
     loop = asyncio.get_running_loop()
-    # 出站队列容量 8（约 160ms@20ms/chunk），用于吸收接收速率波动。
-    # 小队列防止推理突发输出在服务端过度堆积。
+    # 出站队列容量 12（约 240ms@20ms/chunk），刚好容纳一个推理块的输出。
     # outgoing_queue: (proc_time_ms, enqueue_time_s, ts_ns, audio_chunk)
-    outgoing_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=8)
+    outgoing_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=12)
 
     async def sender_loop():
         next_deadline = time.perf_counter()
@@ -252,9 +251,13 @@ async def binary_echo_handler(websocket):
                 stream_chunk_ms = 20
             interval_s = stream_chunk_ms / 1000.0
 
-            # 等待队列中有数据（超时避免永久阻塞，同时允许动态读取 stream_chunk_ms）
+            # 队列积压阈值：约 80ms 的数据量（4 包@20ms）
+            burst_threshold = max(2, int(80 / stream_chunk_ms))
+            q_size = outgoing_queue.qsize()
+
+            # 等待队列中有数据
             try:
-                item = await asyncio.wait_for(outgoing_queue.get(), timeout=0.100)
+                item = await asyncio.wait_for(outgoing_queue.get(), timeout=0.050)
             except asyncio.TimeoutError:
                 continue
 
@@ -262,16 +265,19 @@ async def binary_echo_handler(websocket):
 
             now = time.perf_counter()
 
-            # 恒定节拍发送（不区分 burst/pace，避免客户端收到突发包后出现长间隙导致 underrun）
-            if now < next_deadline:
-                await asyncio.sleep(next_deadline - now)
-                now = time.perf_counter()
-
-            # 如果落后超过 2 个间隔（> 40ms），重置 deadline 避免不必要的追赶延迟
-            if now > next_deadline + 2 * interval_s:
-                next_deadline = now
-
-            next_deadline += interval_s
+            if q_size <= burst_threshold:
+                # 正常模式：按 stream_chunk_ms 节拍发送
+                if now < next_deadline:
+                    await asyncio.sleep(next_deadline - now)
+                    now = time.perf_counter()
+                if now > next_deadline + 1.0:
+                    next_deadline = now
+                next_deadline += interval_s
+            else:
+                # 追赶模式：以 3 倍速发送（约 7ms/包），快速降低队列但不瞬间清空
+                # 这样客户端有足够时间让 JitterEstimator 检测到 IAT 变化
+                await asyncio.sleep(interval_s / 3)
+                next_deadline = now + interval_s
 
             # 计算队列等待时间
             queue_wait_ms = int((time.perf_counter() - enqueue_time) * 1000)
@@ -1122,20 +1128,21 @@ async def binary_echo_handler(websocket):
                     # 记录入队时间，用于计算在输出队列中的等待时间
                     enqueue_time = time.perf_counter()
                     
-                    # 使用阻塞 put，让 sender 的发包节奏自然反压推理输出速率
-                    # 队列小（maxsize=8），不会长时间阻塞
+                    # 队列满时丢弃最旧包（queue=12 恰好容纳一个 250ms 块的输出，正常不应溢出）
+                    while outgoing_queue.full():
+                        try:
+                            outgoing_queue.get_nowait()
+                            outgoing_queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
                     try:
-                        await asyncio.wait_for(
-                            outgoing_queue.put((out_proc, enqueue_time, chunk_ts_ns, chunk)),
-                            timeout=2.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logging.warning("输出队列阻塞超过 2s，丢弃音频块")
-                        break
+                        outgoing_queue.put_nowait((out_proc, enqueue_time, chunk_ts_ns, chunk))
+                    except asyncio.QueueFull:
+                        pass
                 
-                # 队列积压监控（阈值为 6，容量 8 的 75%）
+                # 队列积压监控（阈值为 9，容量 12 的 75%）
                 queue_size = outgoing_queue.qsize()
-                if queue_size > 6:
+                if queue_size > 9:
                     now = time.perf_counter()
                     if now - last_backlog_log_ts > 5.0:
                         logging.warning(f"输出队列积压: {queue_size} 包")
