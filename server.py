@@ -1135,7 +1135,32 @@ async def binary_echo_handler(websocket):
         log_subscribers.discard(websocket)
         sender_task.cancel()
 
+def _cuda_warmup() -> None:
+    """在子线程中执行一次小型推理，提前初始化 CUDA context 和 cuDNN handles。"""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return
+        device = torch.device("cuda")
+        # 初始化 CUDA context
+        t = torch.zeros(1, device=device)
+        # 触发 cuDNN conv handles（常见于 HuBERT 内部的 Conv1d）
+        dummy = torch.randn(1, 1, 3200, device=device)
+        conv = torch.nn.Conv1d(1, 1, 3, padding=1, bias=False).to(device)
+        with torch.no_grad():
+            _ = conv(dummy)
+        del t, dummy, conv
+        torch.cuda.synchronize()
+        logging.info("CUDA warmup complete.")
+    except Exception as e:
+        logging.warning(f"CUDA warmup failed (non-fatal): {e}")
+
+
 async def main():
+    # 后台预热 CUDA context，减少首次加载模型时的冷启动延迟
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _cuda_warmup)
+
     # max_size=None 允许大包传输
     broadcaster_task = asyncio.create_task(log_broadcaster())
     try:
