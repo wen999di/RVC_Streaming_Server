@@ -51,6 +51,18 @@ class LoadedModelInfo:
  
  
 _HUBERT_CACHE: dict[tuple[str, bool, str], torch.nn.Module] = {}
+_RMVPE_CACHE: dict[tuple[str, bool, str], object] = {}
+
+
+def _load_rmvpe(device: torch.device, is_half: bool, rmvpe_path: str):
+    key = (str(device), bool(is_half), str(rmvpe_path))
+    cached = _RMVPE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    from rmvpe import RMVPE
+    instance = RMVPE(rmvpe_path, is_half=is_half, device=device, use_jit=False)
+    _RMVPE_CACHE[key] = instance
+    return instance
  
  
 def _load_hubert(device: torch.device, is_half: bool, hubert_path: str) -> torch.nn.Module:
@@ -414,32 +426,25 @@ class RealtimeRVCInferer:
  
     def _get_f0_rmvpe(self, x_16k: torch.Tensor, f0_up_key: float) -> tuple[torch.Tensor, torch.Tensor]:
         if self._rmvpe is None:
-            from rmvpe import RMVPE
-            
             rmvpe_path = self._rmvpe_path
             if not rmvpe_path:
                 files_dir = Path(__file__).parent / "files"
                 alt_rmvpe = files_dir / "rmvpe.pt"
                 if alt_rmvpe.exists():
                     rmvpe_path = str(alt_rmvpe)
-            
-            if not os.path.exists(rmvpe_path):
-                 # Try finding in files if only filename given
-                 if self._rmvpe_path and not os.path.isabs(self._rmvpe_path):
-                     files_dir = Path(__file__).parent / "files"
-                     alt = files_dir / self._rmvpe_path
-                     if alt.exists():
-                         rmvpe_path = str(alt)
 
             if not os.path.exists(rmvpe_path):
-                 raise FileNotFoundError(f"找不到 RMVPE 权重: {rmvpe_path}")
+                # Try finding in files if only filename given
+                if self._rmvpe_path and not os.path.isabs(self._rmvpe_path):
+                    files_dir = Path(__file__).parent / "files"
+                    alt = files_dir / self._rmvpe_path
+                    if alt.exists():
+                        rmvpe_path = str(alt)
 
-            self._rmvpe = RMVPE(
-                rmvpe_path,
-                is_half=self.is_half,
-                device=self.device,
-                use_jit=False,
-            )
+            if not os.path.exists(rmvpe_path):
+                raise FileNotFoundError(f"找不到 RMVPE 权重: {rmvpe_path}")
+
+            self._rmvpe = _load_rmvpe(self.device, self.is_half, rmvpe_path)
         f0 = self._rmvpe.infer_from_audio(x_16k, thred=0.03)
         f0 = f0 * pow(2.0, float(f0_up_key) / 12.0)
         return self._get_f0_post(f0)

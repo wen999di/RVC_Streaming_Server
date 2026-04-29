@@ -1135,31 +1135,45 @@ async def binary_echo_handler(websocket):
         log_subscribers.discard(websocket)
         sender_task.cancel()
 
-def _cuda_warmup() -> None:
-    """在子线程中执行一次小型推理，提前初始化 CUDA context 和 cuDNN handles。"""
+def _preload_base_models() -> None:
+    """服务器启动时，在后台线程预加载 Hubert Base 和 RMVPE 基础模型，减少首次推理延迟。"""
     try:
         import torch
-        if not torch.cuda.is_available():
-            return
-        device = torch.device("cuda")
-        # 初始化 CUDA context
-        t = torch.zeros(1, device=device)
-        # 触发 cuDNN conv handles（常见于 HuBERT 内部的 Conv1d）
-        dummy = torch.randn(1, 1, 3200, device=device)
-        conv = torch.nn.Conv1d(1, 1, 3, padding=1, bias=False).to(device)
-        with torch.no_grad():
-            _ = conv(dummy)
-        del t, dummy, conv
-        torch.cuda.synchronize()
-        logging.info("CUDA warmup complete.")
+        from rvc_infer import _load_hubert, _load_rmvpe
+        from pathlib import Path
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        is_half = device.type == "cuda"
+
+        slots_info = model_registry.list_slots()
+        files_dir = upload_manager.files_dir
+
+        # 预加载 Hubert Base
+        hubert_active = slots_info.get("hubert_base", {}).get("active", "")
+        if hubert_active:
+            hubert_path = files_dir / hubert_active
+            if hubert_path.exists():
+                logging.info(f"Preloading Hubert model: {hubert_active}")
+                _load_hubert(device, is_half, str(hubert_path))
+                logging.info("Hubert model preloaded.")
+
+        # 预加载 RMVPE
+        rmvpe_active = slots_info.get("rmvpe", {}).get("active", "")
+        if rmvpe_active:
+            rmvpe_path = files_dir / rmvpe_active
+            if rmvpe_path.exists():
+                logging.info(f"Preloading RMVPE model: {rmvpe_active}")
+                _load_rmvpe(device, is_half, str(rmvpe_path))
+                logging.info("RMVPE model preloaded.")
+
     except Exception as e:
-        logging.warning(f"CUDA warmup failed (non-fatal): {e}")
+        logging.warning(f"Base model preload failed (non-fatal): {e}")
 
 
 async def main():
-    # 后台预热 CUDA context，减少首次加载模型时的冷启动延迟
+    # 后台预加载 Hubert Base 和 RMVPE，减少首次加载模型时的延迟
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _cuda_warmup)
+    loop.run_in_executor(None, _preload_base_models)
 
     # max_size=None 允许大包传输
     broadcaster_task = asyncio.create_task(log_broadcaster())
