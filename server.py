@@ -464,7 +464,34 @@ async def binary_echo_handler(websocket):
                             logging.error(f"Error listing logs: {e}", exc_info=True)
                             await websocket.send(json.dumps({"status": "error", "message": f"List logs error: {str(e)}"}))
 
-                    # 3. 读取日志内容命令
+                    # 3. 清空历史日志命令
+                    elif "command" in data and data["command"] == "clear_old_logs":
+                        try:
+                            current_basename = os.path.basename(CURRENT_LOG_FILE)
+                            log_files = glob.glob(os.path.join(LOG_DIR, "*.log"))
+                            deleted = 0
+                            for f in log_files:
+                                if os.path.basename(f) != current_basename:
+                                    try:
+                                        os.remove(f)
+                                        deleted += 1
+                                    except Exception:
+                                        pass
+                            logging.info(f"Cleared {deleted} old log file(s).")
+                            # 返回更新后的日志列表
+                            remaining = glob.glob(os.path.join(LOG_DIR, "*.log"))
+                            remaining.sort(key=os.path.getmtime, reverse=True)
+                            await websocket.send(json.dumps({
+                                "status": "ok",
+                                "type": "log_list",
+                                "files": [os.path.basename(f) for f in remaining],
+                                "current": current_basename,
+                            }))
+                        except Exception as e:
+                            logging.error(f"Error clearing logs: {e}", exc_info=True)
+                            await websocket.send(json.dumps({"status": "error", "message": f"Clear logs error: {str(e)}"}))
+
+                    # 4. 读取日志内容命令
                     elif "command" in data and data["command"] == "read_log":
                         filename = data.get("filename")
                         # 如果没有指定文件名，或文件名是 special token "current"，则读取当前日志
