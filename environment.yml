@@ -13,8 +13,8 @@ dependencies:
   - librosa
   - websockets
   - fairseq
+  - pip
   - pip:
       - --index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
       - pyworld
       - praat-parselmouth
-      - soundfile

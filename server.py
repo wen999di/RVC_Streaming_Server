@@ -351,15 +351,10 @@ async def binary_echo_handler(websocket):
                         seq = data.get("seq", None)
                         passthrough = bool(cfg.get("passthrough", False))
                         
-                        # Handle Model Path Resolution if 'model_path' is provided
+                        # 校验音色模型文件存在（路径解析统一由 _resolve_runtime_config 处理）
                         if "model_path" in cfg and not passthrough:
                             client_pth = os.path.basename(str(cfg.get("model_path") or ""))
-                            if client_pth:
-                                candidate_pth = upload_manager.files_dir / client_pth
-                                if candidate_pth.exists() and candidate_pth.is_file():
-                                    cfg["model_path"] = client_pth
-
-                            if not cfg.get("model_path"):
+                            if not client_pth or not (upload_manager.files_dir / client_pth).is_file():
                                 logging.error(f"Config Error: Voice model not found. client_pth={client_pth}")
                                 await websocket.send(
                                     json.dumps(
@@ -371,19 +366,10 @@ async def binary_echo_handler(websocket):
                                     )
                                 )
                                 continue
-                        elif "model_path" in cfg and passthrough:
-                            cfg["model_path"] = os.path.basename(str(cfg.get("model_path") or "")) if cfg.get("model_path") else ""
-                        
-                        # Handle Index Path Resolution if 'index_path' is provided
+
                         if "index_path" in cfg:
                             client_index = os.path.basename(str(cfg.get("index_path") or ""))
-                            if client_index:
-                                candidate_index = upload_manager.files_dir / client_index
-                                if candidate_index.exists() and candidate_index.is_file():
-                                    cfg["index_path"] = client_index
-                                else:
-                                    cfg["index_path"] = ""
-                            else:
+                            if not client_index or not (upload_manager.files_dir / client_index).is_file():
                                 cfg["index_path"] = ""
 
                         # 注入 Registry 中的基模路径 (Hubert/RMVPE)
@@ -1118,7 +1104,7 @@ async def binary_echo_handler(websocket):
                     continue
                 empty_out_streak = 0
 
-                stream_chunk_ms = int(processor.config.get("stream_chunk_ms", 20) or 20)
+                stream_chunk_ms = int(processor.config.get("stream_chunk_ms") or 20)
                 if stream_chunk_ms <= 0:
                     stream_chunk_ms = 20
                 
