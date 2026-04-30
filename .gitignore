@@ -7,3 +7,4 @@ model_registry.json
 files/*
 uploads/*
 logs/*
+.pixi/

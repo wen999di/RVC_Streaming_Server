@@ -220,14 +220,73 @@ class HubertModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Loader (replaces fairseq.checkpoint_utils.load_model_ensemble_and_task)
+# Safe checkpoint loader (bypasses fairseq pickle references)
 # ---------------------------------------------------------------------------
 
-def load_hubert(checkpoint_path: str, device: torch.device, is_half: bool) -> HubertModel:
-    cpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+import pickle as _pickle
+import sys as _sys
 
-    cfg = cpt.get("cfg", {}).get("model", {}) if isinstance(cpt.get("cfg"), dict) else {}
+
+def _patch_pickle_for_fairseq():
+    """Make pickle.Unpickler tolerant of missing fairseq/omegaconf modules.
+
+    fairseq checkpoints contain pickled fairseq config objects. torch.load
+    with weights_only=False tries to reconstruct them via pickle, which requires
+    those modules to be importable. This patch returns inert dummy objects for
+    any unrecognised module, allowing torch.load to succeed.
+    """
+    _original_find_class = _pickle.Unpickler.find_class
+
+    def _dummy_class():
+        return type("_Dummy", (), {
+            "__init__": lambda self, *a, **kw: None,
+            "__setstate__": lambda self, state: None,
+        })
+
+    def _patched_find_class(self, module, name):
+        if module.startswith(("fairseq", "omegaconf")):
+            return _dummy_class()
+        try:
+            return _original_find_class(self, module, name)
+        except (ModuleNotFoundError, ImportError):
+            return _dummy_class()
+
+    _pickle.Unpickler.find_class = _patched_find_class
+    return _original_find_class
+
+
+def _restore_pickle_find_class(original):
+    _pickle.Unpickler.find_class = original
+
+
+def _ensure_dummy_modules():
+    """Register dummy modules so import statements inside pickle don't crash."""
+    for mod in ("fairseq", "fairseq.models", "fairseq.modules",
+                "fairseq.checkpoint_utils", "fairseq.data", "fairseq.tasks",
+                "fairseq.dataclass", "fairseq_cli", "omegaconf"):
+        if mod not in _sys.modules:
+            _sys.modules[mod] = type(_sys)(mod)
+
+
+def load_hubert(checkpoint_path: str, device: torch.device, is_half: bool) -> HubertModel:
+    _ensure_dummy_modules()
+    _orig_find = _patch_pickle_for_fairseq()
+    try:
+        cpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    finally:
+        _restore_pickle_find_class(_orig_find)
+
+    if not isinstance(cpt, dict):
+        raise RuntimeError(f"Unrecognised checkpoint format: {type(cpt)}")
+
+    cfg = cpt.get("cfg", {})
+    if isinstance(cfg, dict):
+        cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
+    else:
+        cfg = {}
     state_dict = cpt.get("model", cpt)
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"Checkpoint has no state dict under 'model' key")
 
     conv_dim = cfg.get("conv_feature_layers", "[(512,10,5)] + [(512,3,2)] * 4 + [(512,2,2)] * 2")
     if isinstance(conv_dim, str):
