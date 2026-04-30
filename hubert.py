@@ -223,44 +223,47 @@ class HubertModel(nn.Module):
 # Safe checkpoint loader (bypasses fairseq pickle references)
 # ---------------------------------------------------------------------------
 
-import pickle as _pickle
+import pickle as _real_pickle
 import sys as _sys
 
 
-def _patch_pickle_for_fairseq():
-    """Make pickle.Unpickler tolerant of missing fairseq/omegaconf modules.
+def _dummy_class():
+    return type("_Dummy", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "__setstate__": lambda self, state: None,
+    })
 
-    fairseq checkpoints contain pickled fairseq config objects. torch.load
-    with weights_only=False tries to reconstruct them via pickle, which requires
-    those modules to be importable. This patch returns inert dummy objects for
-    any unrecognised module, allowing torch.load to succeed.
+
+class _SafeUnpickler(_real_pickle.Unpickler):
+    """Custom Unpickler that tolerates missing fairseq/omegaconf classes.
+
+    fairseq checkpoints contain pickled fairseq config objects that reference
+    fairseq Python classes. When fairseq is not installed, pickle's find_class
+    raises ModuleNotFoundError. This subclass returns inert dummy objects for
+    unrecognised modules so torch.load can extract the tensor state dict.
     """
-    _original_find_class = _pickle.Unpickler.find_class
 
-    def _dummy_class():
-        return type("_Dummy", (), {
-            "__init__": lambda self, *a, **kw: None,
-            "__setstate__": lambda self, state: None,
-        })
-
-    def _patched_find_class(self, module, name):
+    def find_class(self, module, name):
         if module.startswith(("fairseq", "omegaconf")):
             return _dummy_class()
         try:
-            return _original_find_class(self, module, name)
+            return super().find_class(module, name)
         except (ModuleNotFoundError, ImportError):
             return _dummy_class()
 
-    _pickle.Unpickler.find_class = _patched_find_class
-    return _original_find_class
 
+class _SafePickleModule:
+    """Module-like object that delegates to the real pickle module,
+    but substitutes our SafeUnpickler so torch.load uses it."""
 
-def _restore_pickle_find_class(original):
-    _pickle.Unpickler.find_class = original
+    Unpickler = _SafeUnpickler
+
+    def __getattr__(self, name):
+        return getattr(_real_pickle, name)
 
 
 def _ensure_dummy_modules():
-    """Register dummy modules so import statements inside pickle don't crash."""
+    """Register dummy modules so that 'import fairseq' inside pickle won't crash."""
     for mod in ("fairseq", "fairseq.models", "fairseq.modules",
                 "fairseq.checkpoint_utils", "fairseq.data", "fairseq.tasks",
                 "fairseq.dataclass", "fairseq_cli", "omegaconf"):
@@ -270,11 +273,12 @@ def _ensure_dummy_modules():
 
 def load_hubert(checkpoint_path: str, device: torch.device, is_half: bool) -> HubertModel:
     _ensure_dummy_modules()
-    _orig_find = _patch_pickle_for_fairseq()
-    try:
-        cpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    finally:
-        _restore_pickle_find_class(_orig_find)
+    cpt = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+        pickle_module=_SafePickleModule(),
+    )
 
     if not isinstance(cpt, dict):
         raise RuntimeError(f"Unrecognised checkpoint format: {type(cpt)}")
