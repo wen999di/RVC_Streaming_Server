@@ -49,14 +49,8 @@ def _load_hubert(device: torch.device, is_half: bool, hubert_path: str) -> torch
     if cached is not None:
         return cached
  
-    import fairseq
-    models, _, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
-        [hubert_path],
-        suffix="",
-    )
-    hubert = models[0].to(device)
-    hubert = hubert.half() if is_half else hubert.float()
-    hubert.eval()
+    from hubert import load_hubert
+    hubert = load_hubert(hubert_path, device, is_half)
     _HUBERT_CACHE[key] = hubert
     return hubert
  

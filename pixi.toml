@@ -2,10 +2,10 @@
 name = "RVC"
 version = "0.1.0"
 channels = ["conda-forge", "pytorch", "nvidia"]
-platforms = ["linux-64"]
+platforms = ["linux-64","win-64"]
 
 [workspace.pypi-options]
-index-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+index-url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [dependencies]
 python = "3.10.*"
@@ -15,7 +15,6 @@ librosa = ">=0.10,<1"
 websockets = ">=12,<13"
 pytorch = "2.5.1.*"
 faiss-gpu = ">=1.7,<2"
-fairseq = ">=0.12,<1"
 pip = ">=23,<25"
 
 [pypi-dependencies]
