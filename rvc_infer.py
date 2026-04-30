@@ -1,5 +1,4 @@
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections import OrderedDict
@@ -7,29 +6,8 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
- 
- 
-class RVCDependencyError(RuntimeError):
-    pass
- 
- 
-def _ensure_webui_importable() -> None:
-    pass
- 
- 
-def _resample_1d(wav: torch.Tensor, orig_sr: int, new_sr: int) -> torch.Tensor:
-    if orig_sr == new_sr:
-        return wav
-    if wav.numel() == 0:
-        return wav
-    x = wav.view(1, 1, -1)
-    new_len = int(round(x.shape[-1] * (float(new_sr) / float(orig_sr))))
-    if new_len <= 0:
-        return wav[:0]
-    y = F.interpolate(x, size=new_len, mode="linear", align_corners=True)
-    return y.view(-1)
- 
- 
+
+
 def _resample_units(wav_bt: torch.Tensor, orig_units: int, new_units: int) -> torch.Tensor:
     if orig_units == new_units:
         return wav_bt

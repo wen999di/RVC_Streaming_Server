@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile rvc_infer.py)",
+      "Bash(python -m py_compile rvc_modules.py)",
+      "Bash(python -m py_compile attentions.py)",
+      "Bash(python -m py_compile rmvpe.py)",
+      "Bash(python -m py_compile models.py)",
+      "Bash(python -m py_compile commons.py)",
+      "Bash(python -m py_compile server.py)",
+      "Bash(python -m py_compile rvc_core.py)",
+      "Bash(python -m py_compile file_transfer.py)",
+      "Bash(python -m py_compile model_registry.py)",
+      "Bash(python -c \"import commons; print\\('commons:', [x for x in dir\\(commons\\) if not x.startswith\\('_'\\)]\\)\")",
+      "Bash(python -c \"from commons import init_weights, get_padding, sequence_mask; print\\('commons imports OK'\\)\")",
+      "Bash(python -c \"import file_transfer; print\\('file_transfer OK'\\)\")",
+      "Bash(python -c \"import model_registry; print\\('model_registry OK'\\)\")",
+      "Bash(python -c \"import torchgate; print\\('torchgate OK'\\)\")",
+      "Bash(python -c \"import rvc_modules; print\\('rvc_modules OK'\\)\")",
+      "Bash(python -c \"import attentions; print\\('attentions OK'\\)\")",
+      "Bash(python -c \"import rmvpe; print\\('rmvpe OK'\\)\")"
+    ]
+  }
+}

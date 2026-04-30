@@ -521,7 +521,7 @@ async def binary_echo_handler(websocket):
                             logging.error(f"Error reading log: {e}", exc_info=True)
                             await websocket.send(json.dumps({"status": "error", "message": f"Read log error: {str(e)}"}))
                             
-                    # 4. 实时日志订阅命令
+                    # 5. 实时日志订阅命令
                     elif "command" in data and data["command"] == "watch_log":
                         action = data.get("action")
                         if action == "start":
