@@ -19,12 +19,16 @@ from torch.nn.utils import weight_norm
 # ---------------------------------------------------------------------------
 # Conv feature extractor  (matches fairseq ConvFeatureExtractionModel)
 # ---------------------------------------------------------------------------
-# fairseq Wav2Vec2.0 base: only the *first* conv layer includes LayerNorm;
-# the remaining six layers are Conv1d -> Dropout -> GELU.
+# fairseq Wav2Vec2.0 base in "default" extractor_mode:
+#   Layer 0: Conv1d -> Dropout -> GroupNorm -> GELU
+#   Layers 1-6: Conv1d -> Dropout -> GELU
+# Fairseq's Fp32GroupNorm(dim, dim) = GroupNorm(num_groups=dim, num_channels=dim),
+# which normalises each channel independently (equivalent to InstanceNorm1d).
+# PyTorch 2.x GroupNorm already computes in fp32 internally when input is fp16.
 
 _CONV_CONFIG = [
     # kernel, stride
-    (10, 5),   # layer 0 — has LayerNorm
+    (10, 5),   # layer 0 — has GroupNorm
     (3, 2),    # layer 1
     (3, 2),    # layer 2
     (3, 2),    # layer 3
@@ -35,17 +39,22 @@ _CONV_CONFIG = [
 
 
 def _make_conv(in_dim: int, out_dim: int, kernel: int, stride: int,
-               with_norm: bool = False) -> nn.Sequential:
-    """Return a Sequential that mirrors fairseq's internal conv-block layout:
-    index 0 = Conv1d, 1 = Dropout, 2 = LayerNorm (if with_norm) else GELU.
+               with_group_norm: bool = False) -> nn.Sequential:
+    """Return a Sequential that mirrors fairseq's internal conv-block layout.
+
+    Fairseq structure (indices in Sequential):
+      0 = Conv1d (bias=False), 1 = Dropout(0.0),
+      2 = GroupNorm (if with_group_norm) else GELU,
+      3 = GELU (only when GroupNorm present at index 2).
     """
-    layers = [
+    layers: list = [
         nn.Conv1d(in_dim, out_dim, kernel, stride=stride,
                   padding=kernel // 2, bias=False),
         nn.Dropout(0.0),
     ]
-    if with_norm:
-        layers.append(nn.LayerNorm(out_dim))
+    if with_group_norm:
+        # Fp32GroupNorm(dim, dim) – one group per channel = InstanceNorm1d
+        layers.append(nn.GroupNorm(num_groups=out_dim, num_channels=out_dim))
     layers.append(nn.GELU())
     return nn.Sequential(*layers)
 
@@ -54,7 +63,7 @@ def _build_conv_layers(conv_dim: int = 512) -> nn.ModuleList:
     layers = nn.ModuleList()
     in_dim = 1
     for i, (k, s) in enumerate(_CONV_CONFIG):
-        layers.append(_make_conv(in_dim, conv_dim, k, s, with_norm=(i == 0)))
+        layers.append(_make_conv(in_dim, conv_dim, k, s, with_group_norm=(i == 0)))
         in_dim = conv_dim
     return layers
 

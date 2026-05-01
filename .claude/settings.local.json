@@ -18,7 +18,9 @@
       "Bash(python -c \"import torchgate; print\\('torchgate OK'\\)\")",
       "Bash(python -c \"import rvc_modules; print\\('rvc_modules OK'\\)\")",
       "Bash(python -c \"import attentions; print\\('attentions OK'\\)\")",
-      "Bash(python -c \"import rmvpe; print\\('rmvpe OK'\\)\")"
+      "Bash(python -c \"import rmvpe; print\\('rmvpe OK'\\)\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
