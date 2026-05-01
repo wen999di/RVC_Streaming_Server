@@ -378,16 +378,14 @@ def load_hubert(checkpoint_path: str, device: torch.device,
     encoder_dropout = float(cfg.get("dropout", 0.0))
     final_dim = int(cfg.get("final_dim", 256))
 
-    # Infer pos_conv groups from the checkpoint's weight shape.
-    # weight_norm on Conv1d(embed, embed, k, groups=g) with dim=0 gives
-    #   weight_v: (embed, embed//g, k)
-    # From embed//g we can compute g = embed / (embed//g).
-    pos_conv_groups = encoder_embed_dim  # default: depthwise (one group per channel)
-    wv = state_dict.get("encoder.pos_conv.0.weight_v")
-    if wv is not None and wv.ndim >= 2:
-        inferred = encoder_embed_dim // wv.shape[1]
-        if inferred > 0:
-            pos_conv_groups = inferred
+    # Infer pos_conv groups from the CHECKPOINT'S OWN weight_g shape.
+    # weight_norm(Conv1d, dim=0): weight_g stores norm along dim 0.
+    #   weight_g.shape = (1, embed//groups, kernel)
+    # → groups = embed_dim / weight_g.shape[1]
+    pos_conv_groups = encoder_embed_dim
+    wg = state_dict.get("encoder.pos_conv.0.weight_g")
+    if wg is not None and wg.ndim >= 2 and wg.shape[1] > 0:
+        pos_conv_groups = encoder_embed_dim // wg.shape[1]
 
     model = HubertModel(
         conv_dim=conv_dim,
