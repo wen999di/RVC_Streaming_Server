@@ -142,18 +142,22 @@ class _TransformerEncoderLayer(nn.Module):
 
 
 class _PositionalConv(nn.Module):
-    """Fairseq's weight_norm(Conv1d) can use different `dim` values across
-    checkpoint versions (dim=0, dim=(0,1), etc.), which changes weight_g's shape.
-    This module reads the actual shapes from the checkpoint so every variant works.
+    """Fairseq's make_conv_pos: weight_norm(Conv1d, dim), SamePad, GELU.
 
-    weight_g shape determines which dims were collapsed by the norm:
-      (1, 48, 128) → norm dim=0   |   (1, 1, 128) → norm dim=(0,1)
+    Different fairseq versions use different weight_norm `dim` values
+    (dim=2 in current GitHub source, dim=(0,1) in older checkpoints).
+    This reads weight_g shape directly from the checkpoint to determine
+    which dims were collapsed, so every variant works automatically.
+
+    Also replicates SamePad: for even kernel_size, Conv1d with same-padding
+    produces one extra timestep; SamePad strips it so x + pos_conv(x) works.
     """
 
     def __init__(self, embed_dim, kernel_size, groups, wg_shape):
         super().__init__()
         self.groups = groups
         self.padding = kernel_size // 2
+        self.remove = 1 if kernel_size % 2 == 0 else 0  # SamePad logic
         in_ch = embed_dim // groups
         self.weight_v = nn.Parameter(torch.randn(embed_dim, in_ch, kernel_size))
         self.weight_g = nn.Parameter(torch.zeros(wg_shape))
@@ -164,8 +168,11 @@ class _PositionalConv(nn.Module):
     def forward(self, x):
         norm = torch.linalg.norm(self.weight_v, dim=self._norm_dims, keepdim=True)
         w = self.weight_g * (self.weight_v / norm)
-        return F.conv1d(x, w, self.bias, stride=1,
-                        padding=self.padding, groups=self.groups)
+        out = F.conv1d(x, w, self.bias, stride=1,
+                       padding=self.padding, groups=self.groups)
+        if self.remove > 0:
+            out = out[:, :, :-self.remove]
+        return out
 
 
 class _TransformerEncoder(nn.Module):
