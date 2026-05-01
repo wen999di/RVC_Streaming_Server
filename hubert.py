@@ -7,7 +7,6 @@ Only implements the subset of the fairseq API that RVC uses:
 """
 
 import pickle as _real_pickle
-import sys as _sys
 from typing import Optional
 
 import numpy as np
@@ -444,19 +443,8 @@ class _SafePickleModule:
         return getattr(_real_pickle, name)
 
 
-def _ensure_dummy_modules():
-    """Register fake fairseq / omegaconf modules in sys.modules so that
-    'import fairseq' statements inside pickle don't crash."""
-    for mod in ("fairseq", "fairseq.models", "fairseq.modules",
-                "fairseq.checkpoint_utils", "fairseq.data", "fairseq.tasks",
-                "fairseq.dataclass", "fairseq_cli", "omegaconf"):
-        if mod not in _sys.modules:
-            _sys.modules[mod] = type(_sys)(mod)
-
-
 def load_hubert(checkpoint_path: str, device: torch.device,
                 is_half: bool) -> HubertModel:
-    _ensure_dummy_modules()
     cpt = torch.load(
         checkpoint_path,
         map_location="cpu",
