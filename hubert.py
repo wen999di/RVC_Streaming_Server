@@ -142,26 +142,28 @@ class _TransformerEncoderLayer(nn.Module):
 
 
 class _PositionalConv(nn.Module):
-    """Convolutional positional encoding that replicates fairseq's
-    weight_norm(Conv1d, dim=0) with exact control over parameter shapes.
+    """Fairseq's weight_norm(Conv1d) can use different `dim` values across
+    checkpoint versions (dim=0, dim=(0,1), etc.), which changes weight_g's shape.
+    This module reads the actual shapes from the checkpoint so every variant works.
 
-    weight_norm with dim=0 stores:
-      - weight_v: shape (out_channels, in_channels, kernel) — direction
-      - weight_g: shape (1, in_channels, kernel) — magnitude (norm along dim 0)
+    weight_g shape determines which dims were collapsed by the norm:
+      (1, 48, 128) → norm dim=0   |   (1, 1, 128) → norm dim=(0,1)
     """
 
-    def __init__(self, embed_dim, kernel_size, groups):
+    def __init__(self, embed_dim, kernel_size, groups, wg_shape):
         super().__init__()
         self.groups = groups
         self.padding = kernel_size // 2
         in_ch = embed_dim // groups
-        # Initialise to match fairseq's weight_norm convention
         self.weight_v = nn.Parameter(torch.randn(embed_dim, in_ch, kernel_size))
-        self.weight_g = nn.Parameter(torch.ones(1, in_ch, kernel_size))
+        self.weight_g = nn.Parameter(torch.zeros(wg_shape))
         self.bias = nn.Parameter(torch.zeros(embed_dim))
+        # dims where weight_g is 1 are the dims collapsed by the norm
+        self._norm_dims = tuple(i for i, s in enumerate(wg_shape) if s == 1)
 
     def forward(self, x):
-        w = self.weight_g * F.normalize(self.weight_v, dim=0)
+        norm = torch.linalg.norm(self.weight_v, dim=self._norm_dims, keepdim=True)
+        w = self.weight_g * (self.weight_v / norm)
         return F.conv1d(x, w, self.bias, stride=1,
                         padding=self.padding, groups=self.groups)
 
@@ -171,10 +173,12 @@ class _TransformerEncoder(nn.Module):
 
     def __init__(self, num_layers: int, embed_dim: int, ffn_dim: int,
                  num_heads: int, dropout: float = 0.0,
-                 pos_conv_groups: int | None = None):
+                 pos_conv_groups: int | None = None,
+                 pos_conv_wg_shape: tuple = (1, 1, 128)):
         super().__init__()
         g = pos_conv_groups if pos_conv_groups is not None else embed_dim
-        _conv = _PositionalConv(embed_dim, kernel_size=128, groups=g)
+        _conv = _PositionalConv(embed_dim, kernel_size=128, groups=g,
+                                wg_shape=pos_conv_wg_shape)
         self.pos_conv = nn.Sequential(_conv, nn.GELU())
 
         self.layer_norm = nn.LayerNorm(embed_dim)
@@ -211,6 +215,7 @@ class HubertModel(nn.Module):
         encoder_dropout: float = 0.0,
         final_dim: int = 256,
         pos_conv_groups: int | None = None,
+        pos_conv_wg_shape: tuple = (1, 1, 128),
     ):
         super().__init__()
         self.feature_extractor = nn.Module()
@@ -229,6 +234,7 @@ class HubertModel(nn.Module):
             encoder_layers, encoder_embed_dim, encoder_ffn_embed_dim,
             encoder_attention_heads, encoder_dropout,
             pos_conv_groups=pos_conv_groups,
+            pos_conv_wg_shape=pos_conv_wg_shape,
         )
         self.final_proj = nn.Linear(encoder_embed_dim, final_dim)
 
@@ -378,14 +384,18 @@ def load_hubert(checkpoint_path: str, device: torch.device,
     encoder_dropout = float(cfg.get("dropout", 0.0))
     final_dim = int(cfg.get("final_dim", 256))
 
-    # Infer pos_conv groups from the CHECKPOINT'S OWN weight_g shape.
-    # weight_norm(Conv1d, dim=0): weight_g stores norm along dim 0.
-    #   weight_g.shape = (1, embed//groups, kernel)
-    # → groups = embed_dim / weight_g.shape[1]
-    pos_conv_groups = encoder_embed_dim
+    # Infer pos_conv configuration from checkpoint parameter shapes.
+    # weight_v shape = (embed_dim, embed_dim//groups, kernel) → gives groups.
+    # weight_g shape varies with weight_norm's `dim` parameter; we read it
+    # directly so _PositionalConv can match the norm behaviour exactly.
+    wv = state_dict.get("encoder.pos_conv.0.weight_v")
     wg = state_dict.get("encoder.pos_conv.0.weight_g")
-    if wg is not None and wg.ndim >= 2 and wg.shape[1] > 0:
-        pos_conv_groups = encoder_embed_dim // wg.shape[1]
+    pos_conv_groups = encoder_embed_dim
+    pos_conv_wg_shape = (1, 1, 128)  # fallback
+    if wv is not None and wv.ndim >= 3 and wv.shape[1] > 0:
+        pos_conv_groups = encoder_embed_dim // wv.shape[1]
+    if wg is not None:
+        pos_conv_wg_shape = tuple(wg.shape)
 
     model = HubertModel(
         conv_dim=conv_dim,
@@ -396,6 +406,7 @@ def load_hubert(checkpoint_path: str, device: torch.device,
         encoder_dropout=encoder_dropout,
         final_dim=final_dim,
         pos_conv_groups=pos_conv_groups,
+        pos_conv_wg_shape=pos_conv_wg_shape,
     )
 
     # strict=False: checkpoint may contain pre-training heads (mask_emb,
