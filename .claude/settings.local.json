@@ -21,7 +21,8 @@
       "Bash(python -c \"import rmvpe; print\\('rmvpe OK'\\)\")",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:github.com)",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:anaconda.org)"
     ]
   }
 }

@@ -1149,7 +1149,7 @@ async def binary_echo_handler(websocket):
         sender_task.cancel()
 
 def _preload_base_models() -> None:
-    """服务器启动时，在后台线程预加载 Hubert Base、RMVPE 和 FCPE 模型，减少首次推理延迟。"""
+    """服务器启动时预加载 Hubert Base（所有音色共用），减少首次推理延迟。"""
     try:
         import torch
         from rvc_infer import _load_hubert
@@ -1170,13 +1170,8 @@ def _preload_base_models() -> None:
                 _load_hubert(device, is_half, str(hubert_path))
                 logging.info("Hubert model preloaded.")
 
-        # 预加载 FCPE（默认 F0 方法，内置权重无需模型文件）
-        from rvc_infer import _load_fcpe
-        logging.info("Preloading FCPE model...")
-        _load_fcpe(device)
-        logging.info("FCPE model preloaded.")
-
-        # RMVPE 不预加载——客户端选择 rmvpe 时首次 warmup 懒加载
+        # F0 模型（RMVPE / FCPE）不预加载——首次 warmup 时根据客户端
+        # 选择的 f0method 懒加载到全局缓存，后续切换音色无需重新加载。
 
     except Exception as e:
         logging.warning(f"Base model preload failed (non-fatal): {e}")

@@ -61,7 +61,7 @@ class RVCCore:
         self.passthrough = bool(self.config.get("passthrough", False))
         self.f0_up_key = int(self.config.get("f0_up_key", 0))
         self.formant_shift = float(self.config.get("formant_shift", 0))
-        self.f0_method = self.config.get("f0method", "fcpe")
+        self.f0_method = self.config.get("f0method", "rmvpe")
         self.model_path = str(self.config.get("model_path", "") or "")
         self.index_path = str(self.config.get("index_path", "") or "")
         self.hubert_path = str(self.config.get("hubert_path", "") or "")
