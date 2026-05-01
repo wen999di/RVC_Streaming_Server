@@ -114,6 +114,8 @@ class _MultiheadAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class _TransformerEncoderLayer(nn.Module):
+    """Matches fairseq TransformerSentenceEncoderLayer: POST-norm + GELU."""
+
     def __init__(self, embed_dim: int, ffn_dim: int, num_heads: int,
                  dropout: float = 0.0):
         super().__init__()
@@ -126,18 +128,19 @@ class _TransformerEncoderLayer(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 key_padding_mask: Optional[torch.Tensor] = None):
+        # POST-norm: attention → add → norm → FFN → add → norm
         residual = x
-        x = self.self_attn_layer_norm(x)
         x = self.self_attn(x, key_padding_mask=key_padding_mask)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
+        x = self.self_attn_layer_norm(x)
 
         residual = x
-        x = self.final_layer_norm(x)
-        x = F.relu(self.fc1(x))
+        x = F.gelu(self.fc1(x))
         x = self.fc2(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
+        x = self.final_layer_norm(x)
         return x
 
 
