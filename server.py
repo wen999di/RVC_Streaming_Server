@@ -1149,10 +1149,10 @@ async def binary_echo_handler(websocket):
         sender_task.cancel()
 
 def _preload_base_models() -> None:
-    """服务器启动时，在后台线程预加载 Hubert Base 和 RMVPE 基础模型，减少首次推理延迟。"""
+    """服务器启动时，在后台线程预加载 Hubert Base、RMVPE 和 FCPE 模型，减少首次推理延迟。"""
     try:
         import torch
-        from rvc_infer import _load_hubert, _load_rmvpe
+        from rvc_infer import _load_hubert
         from pathlib import Path
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1170,14 +1170,13 @@ def _preload_base_models() -> None:
                 _load_hubert(device, is_half, str(hubert_path))
                 logging.info("Hubert model preloaded.")
 
-        # 预加载 RMVPE
-        rmvpe_active = slots_info.get("rmvpe", {}).get("active", "")
-        if rmvpe_active:
-            rmvpe_path = files_dir / rmvpe_active
-            if rmvpe_path.exists():
-                logging.info(f"Preloading RMVPE model: {rmvpe_active}")
-                _load_rmvpe(device, is_half, str(rmvpe_path))
-                logging.info("RMVPE model preloaded.")
+        # 预加载 FCPE（默认 F0 方法，内置权重无需模型文件）
+        from rvc_infer import _load_fcpe
+        logging.info("Preloading FCPE model...")
+        _load_fcpe(device)
+        logging.info("FCPE model preloaded.")
+
+        # RMVPE 不预加载——客户端选择 rmvpe 时首次 warmup 懒加载
 
     except Exception as e:
         logging.warning(f"Base model preload failed (non-fatal): {e}")
