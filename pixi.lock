@@ -240,8 +240,14 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/xorg-libxtst-1.2.5-hb9d3cd8_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zlib-ng-2.3.3-hceb46e0_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
+      - pypi: https://mirrors.aliyun.com/pypi/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/d7/32/6f6cf9cfde214487866adc9e7375a68c1638ce3704c782b33b3f145c6344/hyper_connections-0.4.10-py3-none-any.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/d8/f6/074ef5c98f2d062177af24a9e20db20b009d141e4ca827c1e419461595b0/local_attention-1.11.2-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/12/28/020eaa62e6aa75024a3ab7b04305854fabb6c014bfc7fee9c6ac40b28c85/praat_parselmouth-0.4.7-cp310-cp310-manylinux_2_12_x86_64.manylinux2010_x86_64.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/a5/0f/c78d631ffbb4c1aaebf80ff2bf9e791213b381dbe404f9ce1a3eb3672931/pyworld-0.3.5.tar.gz
+      - pypi: https://mirrors.aliyun.com/pypi/packages/92/5e/78ef01a3b65c13566ad39321db413c604085a9a92cd8879c50b0d90c587e/torch_einops_utils-0.0.30-py3-none-any.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/66/dc/5757ed7d8d11a6c14336bcb54e63980979f00005555fec80fb4aa4de5eff/torchaudio-2.11.0-cp310-cp310-manylinux_2_28_x86_64.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/15/98/66da447498a2835b01cb3ae851e1333035a9fbf228e5c6f3e3c4351c06b6/torchfcpe-0.0.4-py3-none-any.whl
       win-64:
       - conda: https://conda.anaconda.org/conda-forge/win-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/audioread-3.0.1-py310h5588dad_3.conda
@@ -374,8 +380,14 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/win-64/xorg-libxdmcp-1.1.5-hba3369d_1.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/zlib-ng-2.3.3-h0261ad2_1.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_6.conda
+      - pypi: https://mirrors.aliyun.com/pypi/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/d7/32/6f6cf9cfde214487866adc9e7375a68c1638ce3704c782b33b3f145c6344/hyper_connections-0.4.10-py3-none-any.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/d8/f6/074ef5c98f2d062177af24a9e20db20b009d141e4ca827c1e419461595b0/local_attention-1.11.2-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/87/5f/b25cb817e4727c759cd92c451d5d8a554929adbf0f4b72c98531f98b698e/praat_parselmouth-0.4.7-cp310-cp310-win_amd64.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/7f/fe/761706a26807c703e6c4e4f47b2d36e644214f6392e8bc20e79845a55808/pyworld-0.3.5-cp310-cp310-win_amd64.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/92/5e/78ef01a3b65c13566ad39321db413c604085a9a92cd8879c50b0d90c587e/torch_einops_utils-0.0.30-py3-none-any.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/cf/f4/8ce2417eac66296e45b7aaa69858403fb6a52b1323f8635ec37b4b0f1fa3/torchaudio-2.11.0-cp310-cp310-win_amd64.whl
+      - pypi: https://mirrors.aliyun.com/pypi/packages/15/98/66da447498a2835b01cb3ae851e1333035a9fbf228e5c6f3e3c4351c06b6/torchfcpe-0.0.4-py3-none-any.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-7_kmp_llvm.conda
   build_number: 7
@@ -837,6 +849,11 @@ packages:
   - pkg:pypi/decorator?source=hash-mapping
   size: 14129
   timestamp: 1740385067843
+- pypi: https://mirrors.aliyun.com/pypi/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl
+  name: einops
+  version: 0.8.2
+  sha256: 54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193
+  requires_python: '>=3.9'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/faiss-1.10.0-cuda129_mkl_py310_h42c3b07_300.conda
   sha256: b385c9ccc2fe2c89eebdbd040bece730bd1924663763f71e73a1058db9c44cc5
   md5: 127dd60dd936ea5f920d97181a88b769
@@ -1119,6 +1136,7 @@ packages:
   depends:
   - python >=3.10
   license: BSD-3-Clause
+  license_family: BSD
   purls:
   - pkg:pypi/fsspec?source=compressed-mapping
   size: 149694
@@ -1236,6 +1254,15 @@ packages:
   - pkg:pypi/hpack?source=hash-mapping
   size: 30731
   timestamp: 1737618390337
+- pypi: https://mirrors.aliyun.com/pypi/packages/d7/32/6f6cf9cfde214487866adc9e7375a68c1638ce3704c782b33b3f145c6344/hyper_connections-0.4.10-py3-none-any.whl
+  name: hyper-connections
+  version: 0.4.10
+  sha256: 9ddef0d034740551fd053813fa13f5b983ce89e7345c22dacf75d5296d80378c
+  requires_dist:
+  - einops>=0.8.1
+  - torch-einops-utils>=0.0.20
+  - torch>=2.5
+  requires_python: '>=3.9'
 - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
   sha256: 77af6f5fe8b62ca07d09ac60127a30d9069fdc3c68d6b256754d0ffb1f7779f8
   md5: 8e6923fc12f1fe8f8c4e5c9f343256ac
@@ -3102,6 +3129,14 @@ packages:
   - pkg:pypi/llvmlite?source=hash-mapping
   size: 22839814
   timestamp: 1776076968141
+- pypi: https://mirrors.aliyun.com/pypi/packages/d8/f6/074ef5c98f2d062177af24a9e20db20b009d141e4ca827c1e419461595b0/local_attention-1.11.2-py3-none-any.whl
+  name: local-attention
+  version: 1.11.2
+  sha256: 8bbb03cef6a6f0b694de64f9ecd81886fd1e73ef367b57f02995b469ac52fd16
+  requires_dist:
+  - einops>=0.8.0
+  - hyper-connections>=0.1.8
+  - torch
 - conda: https://conda.anaconda.org/conda-forge/linux-64/markupsafe-3.0.3-py310h3406613_1.conda
   sha256: 9f3c34f8a7a8dcfed64221a2e19bbe0094ab2c6df7c029b7df713e52c9c9f229
   md5: 671afe636d2a97759804723f5afc22e0
@@ -4484,6 +4519,33 @@ packages:
   purls: []
   size: 3526350
   timestamp: 1769460339384
+- pypi: https://mirrors.aliyun.com/pypi/packages/92/5e/78ef01a3b65c13566ad39321db413c604085a9a92cd8879c50b0d90c587e/torch_einops_utils-0.0.30-py3-none-any.whl
+  name: torch-einops-utils
+  version: 0.0.30
+  sha256: 334aa85b246aca580263cf85857031919835531356b58f938f197eb0a2a6dc08
+  requires_dist:
+  - einops>=0.8.1
+  - torch>=2.5
+  - pytest ; extra == 'test'
+  requires_python: '>=3.9'
+- pypi: https://mirrors.aliyun.com/pypi/packages/66/dc/5757ed7d8d11a6c14336bcb54e63980979f00005555fec80fb4aa4de5eff/torchaudio-2.11.0-cp310-cp310-manylinux_2_28_x86_64.whl
+  name: torchaudio
+  version: 2.11.0
+  sha256: 5847fe2022b17c6580aeb39c8797a443411cc09edfd9183cd50ac1a3b8ccf97c
+- pypi: https://mirrors.aliyun.com/pypi/packages/cf/f4/8ce2417eac66296e45b7aaa69858403fb6a52b1323f8635ec37b4b0f1fa3/torchaudio-2.11.0-cp310-cp310-win_amd64.whl
+  name: torchaudio
+  version: 2.11.0
+  sha256: 7e2da1df4f6fe885c46db350a0dc90a0dff4b54541dff8846faa904d255e2bfe
+- pypi: https://mirrors.aliyun.com/pypi/packages/15/98/66da447498a2835b01cb3ae851e1333035a9fbf228e5c6f3e3c4351c06b6/torchfcpe-0.0.4-py3-none-any.whl
+  name: torchfcpe
+  version: 0.0.4
+  sha256: f042c463d850d76c6f4899a0b84f0b694bb560adf05f4de951097a756d17472d
+  requires_dist:
+  - einops
+  - local-attention
+  - torch
+  - torchaudio
+  - numpy
 - conda: https://conda.anaconda.org/conda-forge/noarch/typing_extensions-4.15.0-pyhcf101f3_0.conda
   sha256: 032271135bca55aeb156cee361c81350c6f3fb203f57d024d7e5a1fc9ef18731
   md5: 0caa1af407ecff61170c9437a808404d

@@ -20,6 +20,7 @@ pip = ">=23,<25"
 [pypi-dependencies]
 pyworld = ">=0.3,<1"
 praat-parselmouth = ">=0.4,<1"
+torchfcpe = ">=0.0.4,<1"
 
 [tasks]
 start = "python server.py"

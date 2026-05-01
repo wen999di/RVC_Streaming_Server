@@ -30,6 +30,7 @@ class LoadedModelInfo:
  
 _HUBERT_CACHE: dict[tuple[str, bool, str], torch.nn.Module] = {}
 _RMVPE_CACHE: dict[tuple[str, bool, str], object] = {}
+_FCPE_CACHE: dict[str, object] = {}
 
 
 def _load_rmvpe(device: torch.device, is_half: bool, rmvpe_path: str):
@@ -41,6 +42,17 @@ def _load_rmvpe(device: torch.device, is_half: bool, rmvpe_path: str):
     instance = RMVPE(rmvpe_path, is_half=is_half, device=device, use_jit=False)
     _RMVPE_CACHE[key] = instance
     return instance
+
+
+def _load_fcpe(device: torch.device):
+    key = str(device)
+    cached = _FCPE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    from torchfcpe import spawn_bundled_infer_model
+    model = spawn_bundled_infer_model(device)
+    _FCPE_CACHE[key] = model
+    return model
  
  
 def _load_hubert(device: torch.device, is_half: bool, hubert_path: str) -> torch.nn.Module:
@@ -421,6 +433,14 @@ class RealtimeRVCInferer:
         f0 = f0 * pow(2.0, float(f0_up_key) / 12.0)
         return self._get_f0_post(f0)
  
+    def _get_f0_fcpe(self, x_16k: torch.Tensor, f0_up_key: float) -> tuple[torch.Tensor, torch.Tensor]:
+        model = _load_fcpe(self.device)
+        x = x_16k.unsqueeze(0).float().to(self.device)
+        f0 = model.infer(x, sr=16000, decoder_mode="local_argmax", threshold=0.006)
+        f0 = f0.squeeze().cpu().numpy().astype(np.float32)
+        f0 = f0 * pow(2.0, float(f0_up_key) / 12.0)
+        return self._get_f0_post(f0)
+
     def _get_f0_harvest(self, x_16k: torch.Tensor, f0_up_key: float) -> tuple[torch.Tensor, torch.Tensor]:
         import pyworld
 
@@ -467,6 +487,8 @@ class RealtimeRVCInferer:
         method = str(method or "rmvpe").lower()
         if method == "rmvpe":
             return self._get_f0_rmvpe(x_16k, f0_up_key)
+        if method == "fcpe":
+            return self._get_f0_fcpe(x_16k, f0_up_key)
         if method == "harvest":
             return self._get_f0_harvest(x_16k, f0_up_key)
         if method == "pm":
