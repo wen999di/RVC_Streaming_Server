@@ -37,6 +37,21 @@ _CONV_CONFIG = [
 ]
 
 
+class _Fp32GroupNorm(nn.GroupNorm):
+    """GroupNorm that casts to float32 internally, matching fairseq's Fp32GroupNorm.
+    Critical for numerical stability when the model runs in float16 mode."""
+
+    def forward(self, input):
+        output = F.group_norm(
+            input.float(),
+            self.num_groups,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        )
+        return output.type_as(input)
+
+
 def _make_conv(in_dim: int, out_dim: int, kernel: int, stride: int,
                with_group_norm: bool = False) -> nn.Sequential:
     """Return a Sequential that mirrors fairseq's internal conv-block layout.
@@ -52,8 +67,9 @@ def _make_conv(in_dim: int, out_dim: int, kernel: int, stride: int,
         nn.Dropout(0.0),
     ]
     if with_group_norm:
-        # Fp32GroupNorm(dim, dim) – one group per channel = InstanceNorm1d
-        layers.append(nn.GroupNorm(num_groups=out_dim, num_channels=out_dim))
+        # Fp32GroupNorm(dim, dim): casts to float32 internally for stability.
+        # Use elementwise_affine=True (default) to have weight+bias params.
+        layers.append(_Fp32GroupNorm(num_groups=out_dim, num_channels=out_dim))
     layers.append(nn.GELU())
     return nn.Sequential(*layers)
 
@@ -72,12 +88,14 @@ def _build_conv_layers(conv_dim: int = 512) -> nn.ModuleList:
 # ---------------------------------------------------------------------------
 
 class _MultiheadAttention(nn.Module):
+    """Fairseq-compatible MHA that delegates to PyTorch's fused CUDA kernel
+    (F.multi_head_attention_forward), matching fairseq's own MultiheadAttention
+    exactly in both computation and performance."""
+
     def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scaling = self.head_dim ** -0.5
         self.dropout = dropout
 
         self.q_proj = nn.Linear(embed_dim, embed_dim)
@@ -87,26 +105,27 @@ class _MultiheadAttention(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 key_padding_mask: Optional[torch.Tensor] = None):
-        """x: (T, B, D)"""
-        T, B, D = x.shape
-        q = self.q_proj(x).view(T, B * self.num_heads, self.head_dim).transpose(0, 1)
-        k = self.k_proj(x).view(T, B * self.num_heads, self.head_dim).transpose(0, 1)
-        v = self.v_proj(x).view(T, B * self.num_heads, self.head_dim).transpose(0, 1)
-
-        attn_weights = torch.bmm(q, k.transpose(1, 2)) * self.scaling
-
-        if key_padding_mask is not None:
-            attn_weights = attn_weights.view(B, self.num_heads, T, T)
-            attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"),
-            )
-            attn_weights = attn_weights.view(B * self.num_heads, T, T)
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn = torch.bmm(attn_weights, v)
-        attn = attn.transpose(0, 1).contiguous().view(T, B, D)
-        attn = self.out_proj(attn)
-        return attn
+        """x: (T, B, D) — same convention as fairseq."""
+        return F.multi_head_attention_forward(
+            query=x, key=x, value=x,
+            embed_dim_to_check=self.embed_dim,
+            num_heads=self.num_heads,
+            in_proj_weight=torch.empty([0]),
+            in_proj_bias=torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias)),
+            bias_k=None, bias_v=None,
+            add_zero_attn=False,
+            dropout_p=self.dropout,
+            out_proj_weight=self.out_proj.weight,
+            out_proj_bias=self.out_proj.bias,
+            training=self.training,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+            attn_mask=None,
+            use_separate_proj_weight=True,
+            q_proj_weight=self.q_proj.weight,
+            k_proj_weight=self.k_proj.weight,
+            v_proj_weight=self.v_proj.weight,
+        )[0]
 
 
 # ---------------------------------------------------------------------------
