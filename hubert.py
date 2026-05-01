@@ -10,6 +10,7 @@ import pickle as _real_pickle
 import sys as _sys
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -61,9 +62,9 @@ def _make_conv(in_dim: int, out_dim: int, kernel: int, stride: int,
       2 = GroupNorm (if with_group_norm) else GELU,
       3 = GELU (only when GroupNorm present at index 2).
     """
+    # fairseq uses NO padding on conv layers (see wav2vec2.py line 866).
     layers: list = [
-        nn.Conv1d(in_dim, out_dim, kernel, stride=stride,
-                  padding=kernel // 2, bias=False),
+        nn.Conv1d(in_dim, out_dim, kernel, stride=stride, bias=False),
         nn.Dropout(0.0),
     ]
     if with_group_norm:
@@ -135,31 +136,57 @@ class _MultiheadAttention(nn.Module):
 class _TransformerEncoderLayer(nn.Module):
     """Matches fairseq TransformerSentenceEncoderLayer: POST-norm + GELU."""
 
-    def __init__(self, embed_dim: int, ffn_dim: int, num_heads: int,
-                 dropout: float = 0.0):
+    def __init__(
+        self,
+        embed_dim: int,
+        ffn_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        activation_dropout: float = 0.0,
+        layer_norm_first: bool = False,
+    ):
         super().__init__()
-        self.self_attn = _MultiheadAttention(embed_dim, num_heads, dropout)
+        self.self_attn = _MultiheadAttention(embed_dim, num_heads, attention_dropout)
         self.self_attn_layer_norm = nn.LayerNorm(embed_dim)
         self.fc1 = nn.Linear(embed_dim, ffn_dim)
         self.fc2 = nn.Linear(ffn_dim, embed_dim)
         self.final_layer_norm = nn.LayerNorm(embed_dim)
+        self.layer_norm_first = layer_norm_first
         self.dropout = dropout
+        self.activation_dropout = activation_dropout
 
     def forward(self, x: torch.Tensor,
                 key_padding_mask: Optional[torch.Tensor] = None):
-        # POST-norm: attention → add → norm → FFN → add → norm
         residual = x
-        x = self.self_attn(x, key_padding_mask=key_padding_mask)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        x = residual + x
-        x = self.self_attn_layer_norm(x)
 
-        residual = x
-        x = F.gelu(self.fc1(x))
-        x = self.fc2(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        x = residual + x
-        x = self.final_layer_norm(x)
+        if self.layer_norm_first:
+            x = self.self_attn_layer_norm(x)
+            x = self.self_attn(x, key_padding_mask=key_padding_mask)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = residual + x
+
+            residual = x
+            x = self.final_layer_norm(x)
+            x = F.gelu(self.fc1(x))
+            x = F.dropout(x, p=self.activation_dropout, training=self.training)
+            x = self.fc2(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = residual + x
+        else:
+            # POST-norm: attention → add → norm → FFN → add → norm
+            x = self.self_attn(x, key_padding_mask=key_padding_mask)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = residual + x
+            x = self.self_attn_layer_norm(x)
+
+            residual = x
+            x = F.gelu(self.fc1(x))
+            x = F.dropout(x, p=self.activation_dropout, training=self.training)
+            x = self.fc2(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = residual + x
+            x = self.final_layer_norm(x)
         return x
 
 
@@ -202,6 +229,11 @@ class _TransformerEncoder(nn.Module):
 
     def __init__(self, num_layers: int, embed_dim: int, ffn_dim: int,
                  num_heads: int, dropout: float = 0.0,
+                 attention_dropout: float = 0.0,
+                 activation_dropout: float = 0.0,
+                 layer_norm_first: bool = False,
+                 layerdrop: float = 0.0,
+                 required_seq_len_multiple: int = 1,
                  pos_conv_groups: int | None = None,
                  pos_conv_wg_shape: tuple = (1, 1, 128)):
         super().__init__()
@@ -210,22 +242,63 @@ class _TransformerEncoder(nn.Module):
                                 wg_shape=pos_conv_wg_shape)
         self.pos_conv = nn.Sequential(_conv, nn.GELU())
 
+        self.dropout = dropout
+        self.layer_norm_first = layer_norm_first
+        self.layerdrop = float(layerdrop)
+        self.required_seq_len_multiple = max(1, int(required_seq_len_multiple))
         self.layer_norm = nn.LayerNorm(embed_dim)
         self.layers = nn.ModuleList([
-            _TransformerEncoderLayer(embed_dim, ffn_dim, num_heads, dropout)
+            _TransformerEncoderLayer(
+                embed_dim,
+                ffn_dim,
+                num_heads,
+                dropout=dropout,
+                attention_dropout=attention_dropout,
+                activation_dropout=activation_dropout,
+                layer_norm_first=layer_norm_first,
+            )
             for _ in range(num_layers)
         ])
 
-    def forward(self, x, key_padding_mask=None):
+    def forward(self, x, key_padding_mask=None, tgt_layer: Optional[int] = None):
         # x: (T, B, D)
         x_conv = x.permute(1, 2, 0)           # (B, D, T)
         x_conv = self.pos_conv(x_conv)         # (B, D, T)
         x = x + x_conv.permute(2, 0, 1)        # add positional encoding
 
-        x = self.layer_norm(x)
+        if not self.layer_norm_first:
+            x = self.layer_norm(x)
 
-        for layer in self.layers:
-            x = layer(x, key_padding_mask)
+        T, B, D = x.shape
+        pad_len = (-T) % self.required_seq_len_multiple
+        if pad_len > 0:
+            x = torch.cat((x, x.new_zeros((pad_len, B, D))), dim=0)
+            if key_padding_mask is None:
+                key_padding_mask = torch.zeros((B, T), dtype=torch.bool, device=x.device)
+            key_padding_mask = torch.cat(
+                (
+                    key_padding_mask,
+                    torch.ones((B, pad_len), dtype=torch.bool, device=key_padding_mask.device),
+                ),
+                dim=1,
+            )
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        for i, layer in enumerate(self.layers):
+            dropout_probability = np.random.random() if self.layerdrop > 0.0 else 1.0
+            if (not self.training) or (dropout_probability > self.layerdrop):
+                x = layer(x, key_padding_mask)
+            if tgt_layer is not None and i == tgt_layer:
+                break
+
+        if self.layer_norm_first and tgt_layer is None:
+            x = self.layer_norm(x)
+
+        if pad_len > 0:
+            x = x[:-pad_len]
+            if key_padding_mask is not None:
+                key_padding_mask = key_padding_mask[:, :-pad_len]
         return x
 
 
@@ -242,6 +315,13 @@ class HubertModel(nn.Module):
         encoder_layers: int = 12,
         encoder_attention_heads: int = 12,
         encoder_dropout: float = 0.0,
+        encoder_attention_dropout: float = 0.0,
+        encoder_activation_dropout: float = 0.0,
+        layer_norm_first: bool = False,
+        encoder_layerdrop: float = 0.0,
+        required_seq_len_multiple: int = 1,
+        dropout_input: float = 0.0,
+        dropout_features: float = 0.0,
         final_dim: int = 256,
         pos_conv_groups: int | None = None,
         pos_conv_wg_shape: tuple = (1, 1, 128),
@@ -258,10 +338,17 @@ class HubertModel(nn.Module):
         self.post_extract_proj = (
             nn.Linear(proj_in, proj_out) if proj_in != proj_out else nn.Identity()
         )
+        self.dropout_input = nn.Dropout(dropout_input)
+        self.dropout_features = nn.Dropout(dropout_features)
 
         self.encoder = _TransformerEncoder(
             encoder_layers, encoder_embed_dim, encoder_ffn_embed_dim,
             encoder_attention_heads, encoder_dropout,
+            attention_dropout=encoder_attention_dropout,
+            activation_dropout=encoder_activation_dropout,
+            layer_norm_first=layer_norm_first,
+            layerdrop=encoder_layerdrop,
+            required_seq_len_multiple=required_seq_len_multiple,
             pos_conv_groups=pos_conv_groups,
             pos_conv_wg_shape=pos_conv_wg_shape,
         )
@@ -272,11 +359,11 @@ class HubertModel(nn.Module):
             self._stride *= s
 
     def _compute_conv_output_len(self, input_len: int) -> int:
+        # fairseq formula: floor((L - k) / s + 1) — no padding
         L = input_len
         for k, s in _CONV_CONFIG:
-            p = k // 2
-            L = (L + 2 * p - k) // s + 1
-        return L
+            L = (L - k) // s + 1
+        return max(L, 0)
 
     def extract_features(
         self,
@@ -291,6 +378,7 @@ class HubertModel(nn.Module):
         features = features.transpose(1, 2)            # (B, T', conv_dim)
         features = self.layer_norm(features)            # (B, T', conv_dim)
         features = self.post_extract_proj(features)     # (B, T', embed_dim)
+        features = self.dropout_input(features)
 
         # --- compute key padding mask for transformer ---
         if padding_mask is not None and padding_mask.any():
@@ -310,17 +398,8 @@ class HubertModel(nn.Module):
         # --- encoder (pos_conv + layer_norm + transformer layers) ---
         x = features.transpose(0, 1)                   # (T', B, embed_dim)
 
-        x_conv = x.permute(1, 2, 0)                    # (B, embed_dim, T')
-        x_conv = self.encoder.pos_conv(x_conv)         # (B, embed_dim, T')
-        x = x + x_conv.permute(2, 0, 1)                # add positional encoding
-
-        x = self.encoder.layer_norm(x)
-
-        for i, layer in enumerate(self.encoder.layers):
-            x = layer(x, key_padding_mask=key_padding_mask)
-            if output_layer is not None and i + 1 == output_layer:
-                x = x.transpose(0, 1)                  # (B, T', embed_dim)
-                return [x]
+        tgt_layer = None if output_layer is None else output_layer - 1
+        x = self.encoder(x, key_padding_mask=key_padding_mask, tgt_layer=tgt_layer)
 
         x = x.transpose(0, 1)
         return [x]
@@ -401,6 +480,12 @@ def load_hubert(checkpoint_path: str, device: torch.device,
 
     # --- read architecture params from checkpoint config ---
     conv_feature_layers = cfg.get("conv_feature_layers", None)
+    if isinstance(conv_feature_layers, str):
+        # fairseq configs store conv layers as a string expression
+        try:
+            conv_feature_layers = eval(conv_feature_layers)
+        except Exception:
+            conv_feature_layers = None
     if isinstance(conv_feature_layers, list) and conv_feature_layers:
         conv_dim = conv_feature_layers[0][0]
     else:
@@ -411,7 +496,16 @@ def load_hubert(checkpoint_path: str, device: torch.device,
     encoder_layers = int(cfg.get("encoder_layers", 12))
     encoder_attention_heads = int(cfg.get("encoder_attention_heads", 12))
     encoder_dropout = float(cfg.get("dropout", 0.0))
+    encoder_attention_dropout = float(cfg.get("attention_dropout", 0.0))
+    encoder_activation_dropout = float(cfg.get("activation_dropout", 0.0))
+    layer_norm_first = bool(cfg.get("layer_norm_first", False))
+    encoder_layerdrop = float(cfg.get("encoder_layerdrop", 0.0))
+    required_seq_len_multiple = int(cfg.get("required_seq_len_multiple", 1))
+    dropout_input = float(cfg.get("dropout_input", 0.0))
+    dropout_features = float(cfg.get("dropout_features", 0.0))
     final_dim = int(cfg.get("final_dim", 256))
+    if final_dim <= 0:
+        final_dim = encoder_embed_dim  # fairseq: final_dim <= 0 → encoder_embed_dim
 
     # Infer pos_conv configuration from checkpoint parameter shapes.
     # weight_v shape = (embed_dim, embed_dim//groups, kernel) → gives groups.
@@ -433,6 +527,13 @@ def load_hubert(checkpoint_path: str, device: torch.device,
         encoder_layers=encoder_layers,
         encoder_attention_heads=encoder_attention_heads,
         encoder_dropout=encoder_dropout,
+        encoder_attention_dropout=encoder_attention_dropout,
+        encoder_activation_dropout=encoder_activation_dropout,
+        layer_norm_first=layer_norm_first,
+        encoder_layerdrop=encoder_layerdrop,
+        required_seq_len_multiple=required_seq_len_multiple,
+        dropout_input=dropout_input,
+        dropout_features=dropout_features,
         final_dim=final_dim,
         pos_conv_groups=pos_conv_groups,
         pos_conv_wg_shape=pos_conv_wg_shape,

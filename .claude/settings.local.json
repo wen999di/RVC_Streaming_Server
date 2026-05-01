@@ -20,7 +20,8 @@
       "Bash(python -c \"import attentions; print\\('attentions OK'\\)\")",
       "Bash(python -c \"import rmvpe; print\\('rmvpe OK'\\)\")",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebSearch"
     ]
   }
 }

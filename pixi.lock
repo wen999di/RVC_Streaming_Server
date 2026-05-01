@@ -243,8 +243,6 @@ environments:
       - pypi: https://mirrors.aliyun.com/pypi/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/d7/32/6f6cf9cfde214487866adc9e7375a68c1638ce3704c782b33b3f145c6344/hyper_connections-0.4.10-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/d8/f6/074ef5c98f2d062177af24a9e20db20b009d141e4ca827c1e419461595b0/local_attention-1.11.2-py3-none-any.whl
-      - pypi: https://mirrors.aliyun.com/pypi/packages/12/28/020eaa62e6aa75024a3ab7b04305854fabb6c014bfc7fee9c6ac40b28c85/praat_parselmouth-0.4.7-cp310-cp310-manylinux_2_12_x86_64.manylinux2010_x86_64.whl
-      - pypi: https://mirrors.aliyun.com/pypi/packages/a5/0f/c78d631ffbb4c1aaebf80ff2bf9e791213b381dbe404f9ce1a3eb3672931/pyworld-0.3.5.tar.gz
       - pypi: https://mirrors.aliyun.com/pypi/packages/92/5e/78ef01a3b65c13566ad39321db413c604085a9a92cd8879c50b0d90c587e/torch_einops_utils-0.0.30-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/66/dc/5757ed7d8d11a6c14336bcb54e63980979f00005555fec80fb4aa4de5eff/torchaudio-2.11.0-cp310-cp310-manylinux_2_28_x86_64.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/15/98/66da447498a2835b01cb3ae851e1333035a9fbf228e5c6f3e3c4351c06b6/torchfcpe-0.0.4-py3-none-any.whl
@@ -383,8 +381,6 @@ environments:
       - pypi: https://mirrors.aliyun.com/pypi/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/d7/32/6f6cf9cfde214487866adc9e7375a68c1638ce3704c782b33b3f145c6344/hyper_connections-0.4.10-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/d8/f6/074ef5c98f2d062177af24a9e20db20b009d141e4ca827c1e419461595b0/local_attention-1.11.2-py3-none-any.whl
-      - pypi: https://mirrors.aliyun.com/pypi/packages/87/5f/b25cb817e4727c759cd92c451d5d8a554929adbf0f4b72c98531f98b698e/praat_parselmouth-0.4.7-cp310-cp310-win_amd64.whl
-      - pypi: https://mirrors.aliyun.com/pypi/packages/7f/fe/761706a26807c703e6c4e4f47b2d36e644214f6392e8bc20e79845a55808/pyworld-0.3.5-cp310-cp310-win_amd64.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/92/5e/78ef01a3b65c13566ad39321db413c604085a9a92cd8879c50b0d90c587e/torch_einops_utils-0.0.30-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/cf/f4/8ce2417eac66296e45b7aaa69858403fb6a52b1323f8635ec37b4b0f1fa3/torchaudio-2.11.0-cp310-cp310-win_amd64.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/15/98/66da447498a2835b01cb3ae851e1333035a9fbf228e5c6f3e3c4351c06b6/torchfcpe-0.0.4-py3-none-any.whl
@@ -3707,20 +3703,6 @@ packages:
   - pkg:pypi/pooch?source=hash-mapping
   size: 56833
   timestamp: 1769816568869
-- pypi: https://mirrors.aliyun.com/pypi/packages/12/28/020eaa62e6aa75024a3ab7b04305854fabb6c014bfc7fee9c6ac40b28c85/praat_parselmouth-0.4.7-cp310-cp310-manylinux_2_12_x86_64.manylinux2010_x86_64.whl
-  name: praat-parselmouth
-  version: 0.4.7
-  sha256: 319cd87cc648b57b49f443249bb30612c1c0ac7e084f49ce219e384d96c16098
-  requires_dist:
-  - numpy>=1.7.0
-  requires_python: '>=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*'
-- pypi: https://mirrors.aliyun.com/pypi/packages/87/5f/b25cb817e4727c759cd92c451d5d8a554929adbf0f4b72c98531f98b698e/praat_parselmouth-0.4.7-cp310-cp310-win_amd64.whl
-  name: praat-parselmouth
-  version: 0.4.7
-  sha256: fd6f1946e463dfc1b29a8ac4ad5b9792f5bb2436db74f42f2ee4b04168220583
-  requires_dist:
-  - numpy>=1.7.0
-  requires_python: '>=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pthread-stubs-0.4-hb9d3cd8_1002.conda
   sha256: 9c88f8c64590e9567c6c80823f0328e58d3b1efb0e1c539c0315ceca764e0973
   md5: b3c17d95b5a10c6e64a21fa17573e70e
@@ -4034,24 +4016,6 @@ packages:
   - pkg:pypi/torch?source=hash-mapping
   size: 22096260
   timestamp: 1744328849332
-- pypi: https://mirrors.aliyun.com/pypi/packages/7f/fe/761706a26807c703e6c4e4f47b2d36e644214f6392e8bc20e79845a55808/pyworld-0.3.5-cp310-cp310-win_amd64.whl
-  name: pyworld
-  version: 0.3.5
-  sha256: 829876828de51c7f5fdd06efa0283d69f9897b592e034db9ded857e378bf625c
-  requires_dist:
-  - numpy
-  - nose ; extra == 'test'
-  - numpy ; extra == 'sdist'
-  - cython>=0.24 ; extra == 'sdist'
-- pypi: https://mirrors.aliyun.com/pypi/packages/a5/0f/c78d631ffbb4c1aaebf80ff2bf9e791213b381dbe404f9ce1a3eb3672931/pyworld-0.3.5.tar.gz
-  name: pyworld
-  version: 0.3.5
-  sha256: 1b93e53cddb67a0e4faa34d6cf919ac6c662feb1c8c0ed901d71b595ab396aa3
-  requires_dist:
-  - numpy
-  - nose ; extra == 'test'
-  - numpy ; extra == 'sdist'
-  - cython>=0.24 ; extra == 'sdist'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/qhull-2020.2-h434a139_5.conda
   sha256: 776363493bad83308ba30bcb88c2552632581b143e8ee25b1982c8c743e73abc
   md5: 353823361b1d27eb3960efb076dfcaf6

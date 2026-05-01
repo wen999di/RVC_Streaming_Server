@@ -441,42 +441,6 @@ class RealtimeRVCInferer:
         f0 = f0 * pow(2.0, float(f0_up_key) / 12.0)
         return self._get_f0_post(f0)
 
-    def _get_f0_harvest(self, x_16k: torch.Tensor, f0_up_key: float) -> tuple[torch.Tensor, torch.Tensor]:
-        import pyworld
-
-        x = x_16k.detach().cpu().numpy().astype(np.float64)
-        f0, t = pyworld.harvest(
-            x,
-            fs=16000,
-            f0_ceil=float(self._f0_max),
-            f0_floor=65.0,
-            frame_period=10.0,
-        )
-        f0 = pyworld.stonemask(x, f0, t, 16000)
-        f0 = f0.astype(np.float32) * pow(2.0, float(f0_up_key) / 12.0)
-        return self._get_f0_post(f0)
- 
-    def _get_f0_pm(self, x_16k: torch.Tensor, f0_up_key: float) -> tuple[torch.Tensor, torch.Tensor]:
-        import parselmouth
-
-        x = x_16k.detach().cpu().numpy().astype(np.float32)
-        p_len = x.shape[0] // 160 + 1
-        f0_min = 65.0
-        l_pad = int(np.ceil(1.5 / f0_min * 16000))
-        r_pad = l_pad + 1
-        s = parselmouth.Sound(np.pad(x, (l_pad, r_pad)), 16000).to_pitch_ac(
-            time_step=0.01,
-            voicing_threshold=0.6,
-            pitch_floor=f0_min,
-            pitch_ceiling=float(self._f0_max),
-        )
-        f0 = s.selected_array["frequency"].astype(np.float32)
-        if f0.shape[0] < p_len:
-            pad = np.zeros(p_len - f0.shape[0], dtype=np.float32)
-            f0 = np.concatenate([f0, pad], axis=0)
-        f0 = f0[:p_len] * pow(2.0, float(f0_up_key) / 12.0)
-        return self._get_f0_post(f0)
- 
     def get_f0(
         self,
         x_16k: torch.Tensor,
@@ -489,10 +453,6 @@ class RealtimeRVCInferer:
             return self._get_f0_rmvpe(x_16k, f0_up_key)
         if method == "fcpe":
             return self._get_f0_fcpe(x_16k, f0_up_key)
-        if method == "harvest":
-            return self._get_f0_harvest(x_16k, f0_up_key)
-        if method == "pm":
-            return self._get_f0_pm(x_16k, f0_up_key)
         raise RuntimeError(f"不支持的 f0method: {method}")
  
     def infer(
