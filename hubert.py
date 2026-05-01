@@ -1,62 +1,69 @@
-"""Minimal HuBERT implementation compatible with fairseq checkpoints.
+"""Minimal Wav2Vec2.0 / HuBERT implementation compatible with fairseq checkpoints.
 
-Replaces the fairseq dependency (~500MB+) with ~200 lines of pure PyTorch.
+Replaces the fairseq dependency (~500MB+) with ~250 lines of pure PyTorch.
 Only implements the subset of the fairseq API that RVC uses:
-  - HubertModel.extract_features(source, padding_mask, output_layer)
-  - HubertModel.final_proj
+  - model.extract_features(source, padding_mask, output_layer)
+  - model.final_proj
 """
 
-import math
+import pickle as _real_pickle
+import sys as _sys
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import weight_norm
 
 
 # ---------------------------------------------------------------------------
-# Conv feature extractor (matches fairseq ConvFeatureExtractionModel)
+# Conv feature extractor  (matches fairseq ConvFeatureExtractionModel)
 # ---------------------------------------------------------------------------
+# fairseq Wav2Vec2.0 base: only the *first* conv layer includes LayerNorm;
+# the remaining six layers are Conv1d -> Dropout -> GELU.
 
-def _make_conv_layer(in_dim: int, out_dim: int, kernel: int, stride: int):
-    return nn.Sequential(
-        nn.Conv1d(in_dim, out_dim, kernel, stride=stride, padding=kernel // 2, bias=False),
+_CONV_CONFIG = [
+    # kernel, stride
+    (10, 5),   # layer 0 — has LayerNorm
+    (3, 2),    # layer 1
+    (3, 2),    # layer 2
+    (3, 2),    # layer 3
+    (3, 2),    # layer 4
+    (2, 2),    # layer 5
+    (2, 2),    # layer 6
+]
+
+
+def _make_conv(in_dim: int, out_dim: int, kernel: int, stride: int,
+               with_norm: bool = False) -> nn.Sequential:
+    """Return a Sequential that mirrors fairseq's internal conv-block layout:
+    index 0 = Conv1d, 1 = Dropout, 2 = LayerNorm (if with_norm) else GELU.
+    """
+    layers = [
+        nn.Conv1d(in_dim, out_dim, kernel, stride=stride,
+                  padding=kernel // 2, bias=False),
         nn.Dropout(0.0),
-        nn.GELU(),
-    )
+    ]
+    if with_norm:
+        layers.append(nn.LayerNorm(out_dim))
+    layers.append(nn.GELU())
+    return nn.Sequential(*layers)
 
 
-def _make_conv_layer_norm(in_dim: int, out_dim: int, kernel: int, stride: int):
-    return nn.Sequential(
-        nn.Conv1d(in_dim, out_dim, kernel, stride=stride, padding=kernel // 2, bias=False),
-        nn.Dropout(0.0),
-        nn.LayerNorm(out_dim),
-        nn.GELU(),
-    )
-
-
-# Standard hubert_base conv config: kernel, stride
-_CONV_CONFIG = [(10, 5), (3, 2), (3, 2), (3, 2), (3, 2), (2, 2), (2, 2)]
-
-
-def _build_conv_layers(conv_dim: int = 512):
+def _build_conv_layers(conv_dim: int = 512) -> nn.ModuleList:
     layers = nn.ModuleList()
     in_dim = 1
     for i, (k, s) in enumerate(_CONV_CONFIG):
-        is_last = i == len(_CONV_CONFIG) - 1
-        make = _make_conv_layer if is_last else _make_conv_layer_norm
-        layers.append(make(in_dim, conv_dim, k, s))
+        layers.append(_make_conv(in_dim, conv_dim, k, s, with_norm=(i == 0)))
         in_dim = conv_dim
     return layers
 
 
 # ---------------------------------------------------------------------------
-# Multi-head attention (matches fairseq MultiheadAttention)
+# Multi-head attention  (fairseq-compatible Q/K/V/O projections)
 # ---------------------------------------------------------------------------
 
 class _MultiheadAttention(nn.Module):
-    """Fairseq-compatible multi-head attention with separate Q/K/V/O projections."""
-
     def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
         self.embed_dim = embed_dim
@@ -70,7 +77,8 @@ class _MultiheadAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None):
         """x: (T, B, D)"""
         T, B, D = x.shape
         q = self.q_proj(x).view(T, B * self.num_heads, self.head_dim).transpose(0, 1)
@@ -80,10 +88,9 @@ class _MultiheadAttention(nn.Module):
         attn_weights = torch.bmm(q, k.transpose(1, 2)) * self.scaling
 
         if key_padding_mask is not None:
-            # key_padding_mask: (B, T)  →  broadcast to (B*H, T, T)
             attn_weights = attn_weights.view(B, self.num_heads, T, T)
             attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"),
             )
             attn_weights = attn_weights.view(B * self.num_heads, T, T)
 
@@ -95,11 +102,12 @@ class _MultiheadAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer encoder (matches fairseq TransformerEncoder)
+# Transformer encoder
 # ---------------------------------------------------------------------------
 
 class _TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim: int, ffn_dim: int, num_heads: int, dropout: float = 0.0):
+    def __init__(self, embed_dim: int, ffn_dim: int, num_heads: int,
+                 dropout: float = 0.0):
         super().__init__()
         self.self_attn = _MultiheadAttention(embed_dim, num_heads, dropout)
         self.self_attn_layer_norm = nn.LayerNorm(embed_dim)
@@ -108,7 +116,8 @@ class _TransformerEncoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(embed_dim)
         self.dropout = dropout
 
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None):
         residual = x
         x = self.self_attn_layer_norm(x)
         x = self.self_attn(x, key_padding_mask=key_padding_mask)
@@ -125,22 +134,40 @@ class _TransformerEncoderLayer(nn.Module):
 
 
 class _TransformerEncoder(nn.Module):
-    def __init__(self, num_layers: int, embed_dim: int, ffn_dim: int, num_heads: int, dropout: float = 0.0):
+    """Wav2Vec2.0 encoder with convolutional positional embedding."""
+
+    def __init__(self, num_layers: int, embed_dim: int, ffn_dim: int,
+                 num_heads: int, dropout: float = 0.0):
         super().__init__()
+        # Convolutional positional encoding (weight_norm applied after init)
+        self.pos_conv = nn.Sequential(
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=128,
+                      groups=16, padding=64),
+            nn.GELU(),
+        )
+        weight_norm(self.pos_conv[0], name="weight")
+
+        self.layer_norm = nn.LayerNorm(embed_dim)
         self.layers = nn.ModuleList([
             _TransformerEncoderLayer(embed_dim, ffn_dim, num_heads, dropout)
             for _ in range(num_layers)
         ])
-        self.layer_norm = nn.Identity()  # hubert_base doesn't use final layer norm
 
     def forward(self, x, key_padding_mask=None):
+        # x: (T, B, D)
+        x_conv = x.permute(1, 2, 0)           # (B, D, T)
+        x_conv = self.pos_conv(x_conv)         # (B, D, T)
+        x = x + x_conv.permute(2, 0, 1)        # add positional encoding
+
+        x = self.layer_norm(x)
+
         for layer in self.layers:
             x = layer(x, key_padding_mask)
         return x
 
 
 # ---------------------------------------------------------------------------
-# HuBERT Model
+# Wav2Vec2.0 Model  (compatible with fairseq's Wav2Vec2Model / HubertModel)
 # ---------------------------------------------------------------------------
 
 class HubertModel(nn.Module):
@@ -158,13 +185,15 @@ class HubertModel(nn.Module):
         self.feature_extractor = nn.Module()
         self.feature_extractor.conv_layers = _build_conv_layers(conv_dim)
 
+        # LayerNorm is applied to conv output (512-d) BEFORE projection.
+        self.layer_norm = nn.LayerNorm(conv_dim)
+
         proj_in = conv_dim
         proj_out = encoder_embed_dim
         self.post_extract_proj = (
             nn.Linear(proj_in, proj_out) if proj_in != proj_out else nn.Identity()
         )
 
-        self.layer_norm = nn.LayerNorm(encoder_embed_dim)
         self.encoder = _TransformerEncoder(
             encoder_layers, encoder_embed_dim, encoder_ffn_embed_dim,
             encoder_attention_heads, encoder_dropout,
@@ -188,31 +217,42 @@ class HubertModel(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         output_layer: Optional[int] = None,
     ):
-        # source: (B, T) raw waveform
-        features = source.unsqueeze(1)  # (B, 1, T)
+        # --- conv feature extraction ---
+        features = source.unsqueeze(1)                 # (B, 1, T)
         for conv in self.feature_extractor.conv_layers:
             features = conv(features)
-        features = features.transpose(1, 2)  # (B, T', C)
-        features = self.layer_norm(features)
-        features = self.post_extract_proj(features)
+        features = features.transpose(1, 2)            # (B, T', conv_dim)
+        features = self.layer_norm(features)            # (B, T', conv_dim)
+        features = self.post_extract_proj(features)     # (B, T', embed_dim)
 
-        # Compute key padding mask for transformer
+        # --- compute key padding mask for transformer ---
         if padding_mask is not None and padding_mask.any():
             input_lengths = (padding_mask.logical_not()).sum(dim=1)
             conv_lengths = torch.tensor(
-                [self._compute_conv_output_len(int(l.item())) for l in input_lengths],
+                [self._compute_conv_output_len(int(l.item()))
+                 for l in input_lengths],
                 device=input_lengths.device,
             )
             max_len = features.shape[1]
-            key_padding_mask = torch.arange(max_len, device=features.device).unsqueeze(0) >= conv_lengths.unsqueeze(1)
+            key_padding_mask = torch.arange(
+                max_len, device=features.device
+            ).unsqueeze(0) >= conv_lengths.unsqueeze(1)
         else:
             key_padding_mask = None
 
-        x = features.transpose(0, 1)  # (T', B, C)
+        # --- encoder (pos_conv + layer_norm + transformer layers) ---
+        x = features.transpose(0, 1)                   # (T', B, embed_dim)
+
+        x_conv = x.permute(1, 2, 0)                    # (B, embed_dim, T')
+        x_conv = self.encoder.pos_conv(x_conv)         # (B, embed_dim, T')
+        x = x + x_conv.permute(2, 0, 1)                # add positional encoding
+
+        x = self.encoder.layer_norm(x)
+
         for i, layer in enumerate(self.encoder.layers):
             x = layer(x, key_padding_mask=key_padding_mask)
             if output_layer is not None and i + 1 == output_layer:
-                x = x.transpose(0, 1)  # back to (B, T', C)
+                x = x.transpose(0, 1)                  # (B, T', embed_dim)
                 return [x]
 
         x = x.transpose(0, 1)
@@ -220,12 +260,8 @@ class HubertModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Safe checkpoint loader (bypasses fairseq pickle references)
+# Safe checkpoint loader  (bypasses fairseq pickle references)
 # ---------------------------------------------------------------------------
-
-import pickle as _real_pickle
-import sys as _sys
-
 
 def _dummy_class():
     return type("_Dummy", (), {
@@ -235,12 +271,12 @@ def _dummy_class():
 
 
 class _SafeUnpickler(_real_pickle.Unpickler):
-    """Custom Unpickler that tolerates missing fairseq/omegaconf classes.
+    """Custom Unpickler that returns dummy objects for missing fairseq modules.
 
-    fairseq checkpoints contain pickled fairseq config objects that reference
-    fairseq Python classes. When fairseq is not installed, pickle's find_class
-    raises ModuleNotFoundError. This subclass returns inert dummy objects for
-    unrecognised modules so torch.load can extract the tensor state dict.
+    Wav2Vec2.0 / HuBERT checkpoints contain pickled fairseq config objects.
+    When fairseq is not installed, standard pickle raises ModuleNotFoundError.
+    This subclass returns inert objects so torch.load can still extract the
+    tensor state dict.
     """
 
     def find_class(self, module, name):
@@ -253,8 +289,8 @@ class _SafeUnpickler(_real_pickle.Unpickler):
 
 
 class _SafePickleModule:
-    """Module-like object that delegates to the real pickle module,
-    but substitutes our SafeUnpickler so torch.load uses it."""
+    """Module-like proxy: delegates everything to the real pickle module,
+    except Unpickler which uses our safe subclass."""
 
     Unpickler = _SafeUnpickler
 
@@ -263,7 +299,8 @@ class _SafePickleModule:
 
 
 def _ensure_dummy_modules():
-    """Register dummy modules so that 'import fairseq' inside pickle won't crash."""
+    """Register fake fairseq / omegaconf modules in sys.modules so that
+    'import fairseq' statements inside pickle don't crash."""
     for mod in ("fairseq", "fairseq.models", "fairseq.modules",
                 "fairseq.checkpoint_utils", "fairseq.data", "fairseq.tasks",
                 "fairseq.dataclass", "fairseq_cli", "omegaconf"):
@@ -271,7 +308,8 @@ def _ensure_dummy_modules():
             _sys.modules[mod] = type(_sys)(mod)
 
 
-def load_hubert(checkpoint_path: str, device: torch.device, is_half: bool) -> HubertModel:
+def load_hubert(checkpoint_path: str, device: torch.device,
+                is_half: bool) -> HubertModel:
     _ensure_dummy_modules()
     cpt = torch.load(
         checkpoint_path,
@@ -283,20 +321,21 @@ def load_hubert(checkpoint_path: str, device: torch.device, is_half: bool) -> Hu
     if not isinstance(cpt, dict):
         raise RuntimeError(f"Unrecognised checkpoint format: {type(cpt)}")
 
+    # cfg may be a real dict or a dummy object (from patched pickle)
     cfg = cpt.get("cfg", {})
     if isinstance(cfg, dict):
         cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     else:
         cfg = {}
+
     state_dict = cpt.get("model", cpt)
     if not isinstance(state_dict, dict):
-        raise RuntimeError(f"Checkpoint has no state dict under 'model' key")
+        raise RuntimeError("Checkpoint has no state dict under 'model' key")
 
-    conv_dim = cfg.get("conv_feature_layers", "[(512,10,5)] + [(512,3,2)] * 4 + [(512,2,2)] * 2")
-    if isinstance(conv_dim, str):
-        conv_dim = 512
-    elif isinstance(conv_dim, list):
-        conv_dim = conv_dim[0][0] if conv_dim else 512
+    # --- read architecture params from checkpoint config ---
+    conv_feature_layers = cfg.get("conv_feature_layers", None)
+    if isinstance(conv_feature_layers, list) and conv_feature_layers:
+        conv_dim = conv_feature_layers[0][0]
     else:
         conv_dim = 512
 
@@ -317,7 +356,9 @@ def load_hubert(checkpoint_path: str, device: torch.device, is_half: bool) -> Hu
         final_dim=final_dim,
     )
 
-    model.load_state_dict(state_dict, strict=True)
+    # strict=False: checkpoint may contain pre-training heads (mask_emb,
+    # label_embs_concat, quantizer.*) that we don't need for inference.
+    model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
     model = model.half() if is_half else model.float()
     model.eval()
