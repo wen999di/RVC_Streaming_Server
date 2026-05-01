@@ -13,7 +13,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import weight_norm
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +141,31 @@ class _TransformerEncoderLayer(nn.Module):
         return x
 
 
+class _PositionalConv(nn.Module):
+    """Convolutional positional encoding that replicates fairseq's
+    weight_norm(Conv1d, dim=0) with exact control over parameter shapes.
+
+    weight_norm with dim=0 stores:
+      - weight_v: shape (out_channels, in_channels, kernel) — direction
+      - weight_g: shape (1, in_channels, kernel) — magnitude (norm along dim 0)
+    """
+
+    def __init__(self, embed_dim, kernel_size, groups):
+        super().__init__()
+        self.groups = groups
+        self.padding = kernel_size // 2
+        in_ch = embed_dim // groups
+        # Initialise to match fairseq's weight_norm convention
+        self.weight_v = nn.Parameter(torch.randn(embed_dim, in_ch, kernel_size))
+        self.weight_g = nn.Parameter(torch.ones(1, in_ch, kernel_size))
+        self.bias = nn.Parameter(torch.zeros(embed_dim))
+
+    def forward(self, x):
+        w = self.weight_g * F.normalize(self.weight_v, dim=0)
+        return F.conv1d(x, w, self.bias, stride=1,
+                        padding=self.padding, groups=self.groups)
+
+
 class _TransformerEncoder(nn.Module):
     """Wav2Vec2.0 encoder with convolutional positional embedding."""
 
@@ -150,12 +174,8 @@ class _TransformerEncoder(nn.Module):
                  pos_conv_groups: int | None = None):
         super().__init__()
         g = pos_conv_groups if pos_conv_groups is not None else embed_dim
-        self.pos_conv = nn.Sequential(
-            nn.Conv1d(embed_dim, embed_dim, kernel_size=128,
-                      groups=g, padding=64),
-            nn.GELU(),
-        )
-        weight_norm(self.pos_conv[0], name="weight")
+        _conv = _PositionalConv(embed_dim, kernel_size=128, groups=g)
+        self.pos_conv = nn.Sequential(_conv, nn.GELU())
 
         self.layer_norm = nn.LayerNorm(embed_dim)
         self.layers = nn.ModuleList([
