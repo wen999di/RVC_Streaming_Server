@@ -146,12 +146,13 @@ class _TransformerEncoder(nn.Module):
     """Wav2Vec2.0 encoder with convolutional positional embedding."""
 
     def __init__(self, num_layers: int, embed_dim: int, ffn_dim: int,
-                 num_heads: int, dropout: float = 0.0):
+                 num_heads: int, dropout: float = 0.0,
+                 pos_conv_groups: int | None = None):
         super().__init__()
-        # Convolutional positional encoding (weight_norm applied after init)
+        g = pos_conv_groups if pos_conv_groups is not None else embed_dim
         self.pos_conv = nn.Sequential(
             nn.Conv1d(embed_dim, embed_dim, kernel_size=128,
-                      groups=16, padding=64),
+                      groups=g, padding=64),
             nn.GELU(),
         )
         weight_norm(self.pos_conv[0], name="weight")
@@ -189,6 +190,7 @@ class HubertModel(nn.Module):
         encoder_attention_heads: int = 12,
         encoder_dropout: float = 0.0,
         final_dim: int = 256,
+        pos_conv_groups: int | None = None,
     ):
         super().__init__()
         self.feature_extractor = nn.Module()
@@ -206,6 +208,7 @@ class HubertModel(nn.Module):
         self.encoder = _TransformerEncoder(
             encoder_layers, encoder_embed_dim, encoder_ffn_embed_dim,
             encoder_attention_heads, encoder_dropout,
+            pos_conv_groups=pos_conv_groups,
         )
         self.final_proj = nn.Linear(encoder_embed_dim, final_dim)
 
@@ -355,6 +358,17 @@ def load_hubert(checkpoint_path: str, device: torch.device,
     encoder_dropout = float(cfg.get("dropout", 0.0))
     final_dim = int(cfg.get("final_dim", 256))
 
+    # Infer pos_conv groups from the checkpoint's weight shape.
+    # weight_norm on Conv1d(embed, embed, k, groups=g) with dim=0 gives
+    #   weight_v: (embed, embed//g, k)
+    # From embed//g we can compute g = embed / (embed//g).
+    pos_conv_groups = encoder_embed_dim  # default: depthwise (one group per channel)
+    wv = state_dict.get("encoder.pos_conv.0.weight_v")
+    if wv is not None and wv.ndim >= 2:
+        inferred = encoder_embed_dim // wv.shape[1]
+        if inferred > 0:
+            pos_conv_groups = inferred
+
     model = HubertModel(
         conv_dim=conv_dim,
         encoder_embed_dim=encoder_embed_dim,
@@ -363,6 +377,7 @@ def load_hubert(checkpoint_path: str, device: torch.device,
         encoder_attention_heads=encoder_attention_heads,
         encoder_dropout=encoder_dropout,
         final_dim=final_dim,
+        pos_conv_groups=pos_conv_groups,
     )
 
     # strict=False: checkpoint may contain pre-training heads (mask_emb,
