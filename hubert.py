@@ -1,3 +1,5 @@
+import ast
+import os
 """Minimal Wav2Vec2.0 / HuBERT implementation compatible with fairseq checkpoints.
 
 Replaces the fairseq dependency (~500MB+) with ~250 lines of pure PyTorch.
@@ -445,12 +447,23 @@ class _SafePickleModule:
 
 def load_hubert(checkpoint_path: str, device: torch.device,
                 is_half: bool) -> HubertModel:
-    cpt = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-        pickle_module=_SafePickleModule(),
-    )
+    try:
+        cpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception as safe_error:
+        # Legacy fairseq HuBERT checkpoints may contain pickled config objects.
+        # Unsafe pickle is disabled by default; administrators may explicitly
+        # opt in only for a checkpoint they have independently verified.
+        if os.environ.get("RVC_ALLOW_LEGACY_HUBERT_PICKLE", "").strip() != "1":
+            raise RuntimeError(
+                "HuBERT checkpoint requires legacy pickle. Set "
+                "RVC_ALLOW_LEGACY_HUBERT_PICKLE=1 only for a trusted checkpoint."
+            ) from safe_error
+        cpt = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+            pickle_module=_SafePickleModule(),
+        )
 
     if not isinstance(cpt, dict):
         raise RuntimeError(f"Unrecognised checkpoint format: {type(cpt)}")
@@ -471,7 +484,7 @@ def load_hubert(checkpoint_path: str, device: torch.device,
     if isinstance(conv_feature_layers, str):
         # fairseq configs store conv layers as a string expression
         try:
-            conv_feature_layers = eval(conv_feature_layers)
+            conv_feature_layers = ast.literal_eval(conv_feature_layers)
         except Exception:
             conv_feature_layers = None
     if isinstance(conv_feature_layers, list) and conv_feature_layers:

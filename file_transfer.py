@@ -7,6 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 import struct
+import threading
+import functools
+
+
+def _synchronized(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 FILE_MAGIC = b"RVCFILE1"
@@ -107,6 +117,14 @@ class UploadManager:
         self.partial_dir.mkdir(parents=True, exist_ok=True)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
 
+        self.max_upload_bytes = max(1, int(os.environ.get("RVC_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))))
+        self.max_active_uploads = max(1, int(os.environ.get("RVC_MAX_ACTIVE_UPLOADS", "8")))
+        self.max_reserved_upload_bytes = max(
+            self.max_upload_bytes,
+            int(os.environ.get("RVC_MAX_RESERVED_UPLOAD_BYTES", str(4 * 1024 * 1024 * 1024))),
+        )
+        self.stale_upload_seconds = max(300, int(os.environ.get("RVC_STALE_UPLOAD_SECONDS", "86400")))
+        self._lock = threading.RLock()
         self._uploads: dict[str, UploadMeta] = {}
         self._key_to_upload_id: dict[str, str] = {}
         self._last_meta_flush_s: dict[str, float] = {}
@@ -126,8 +144,15 @@ class UploadManager:
                     meta = UploadMeta.from_dict(json.load(f))
                 part = self._part_path(meta.upload_id)
                 if not part.exists():
+                    p.unlink(missing_ok=True)
+                    continue
+                if _now_s() - float(meta.updated_at) > self.stale_upload_seconds:
+                    p.unlink(missing_ok=True)
+                    part.unlink(missing_ok=True)
                     continue
                 if meta.received_bytes < 0 or meta.received_bytes > meta.size:
+                    p.unlink(missing_ok=True)
+                    part.unlink(missing_ok=True)
                     continue
                 self._uploads[meta.upload_id] = meta
                 if meta.key:
@@ -135,12 +160,15 @@ class UploadManager:
             except Exception:
                 continue
 
+    @_synchronized
     def init_upload(self, *, name: str, size: int, sha256: str) -> UploadMeta:
         safe_name = sanitize_filename(name)
         if size <= 0:
             raise ValueError("invalid size")
+        if size > self.max_upload_bytes:
+            raise ValueError("file_too_large")
         sha256 = (sha256 or "").strip().lower()
-        if sha256 and len(sha256) != 64:
+        if sha256 and (len(sha256) != 64 or any(ch not in "0123456789abcdef" for ch in sha256)):
             raise ValueError("invalid sha256")
 
         key = sha256 or f"name:{safe_name}|size:{size}"
@@ -159,6 +187,12 @@ class UploadManager:
                         self._uploads[existing.upload_id] = existing
                         self._flush_meta(existing, force=True)
                         return existing
+
+        if len(self._uploads) >= self.max_active_uploads:
+            raise ValueError("too_many_active_uploads")
+        reserved = sum(max(0, int(item.size)) for item in self._uploads.values())
+        if reserved + int(size) > self.max_reserved_upload_bytes:
+            raise ValueError("upload_reservation_limit")
 
         upload_id = str(uuid.uuid4())
         meta = UploadMeta(
@@ -179,12 +213,14 @@ class UploadManager:
         self._flush_meta(meta, force=True)
         return meta
 
+    @_synchronized
     def get(self, upload_id: str) -> UploadMeta:
         meta = self._uploads.get(upload_id)
         if not meta:
             raise KeyError("unknown upload_id")
         return meta
 
+    @_synchronized
     def write_chunk_sync(self, *, upload_id: str, offset: int, payload: bytes) -> UploadMeta:
         meta = self.get(upload_id)
         if offset != meta.received_bytes:
@@ -208,6 +244,7 @@ class UploadManager:
         self._flush_meta(meta, force=False)
         return meta
 
+    @_synchronized
     def finish_sync(self, *, upload_id: str) -> Tuple[UploadMeta, str]:
         meta = self.get(upload_id)
         if meta.received_bytes != meta.size:
@@ -227,7 +264,12 @@ class UploadManager:
             stem = target.stem
             suffix = target.suffix
             disambiguator = time.strftime("%Y%m%d_%H%M%S")
-            target = self.files_dir / f"{stem}_{disambiguator}{suffix}"
+            counter = 1
+            candidate = self.files_dir / f"{stem}_{disambiguator}{suffix}"
+            while candidate.exists():
+                counter += 1
+                candidate = self.files_dir / f"{stem}_{disambiguator}_{counter}{suffix}"
+            target = candidate
 
         os.replace(part, target)
 
@@ -238,6 +280,7 @@ class UploadManager:
         self._last_meta_flush_s.pop(upload_id, None)
         return meta, target.name
 
+    @_synchronized
     def abort_sync(self, *, upload_id: str) -> None:
         meta = self._uploads.pop(upload_id, None)
         if meta and meta.key and self._key_to_upload_id.get(meta.key) == upload_id:
@@ -246,6 +289,7 @@ class UploadManager:
         self._meta_path(upload_id).unlink(missing_ok=True)
         self._part_path(upload_id).unlink(missing_ok=True)
 
+    @_synchronized
     def list_files(self) -> list[dict]:
         items: list[dict] = []
         for p in self.files_dir.iterdir():
@@ -262,6 +306,7 @@ class UploadManager:
         items.sort(key=lambda x: x["mtime"], reverse=True)
         return items
 
+    @_synchronized
     def delete_file(self, *, name: str) -> None:
         safe_name = sanitize_filename(name)
         target = self.files_dir / safe_name
@@ -271,6 +316,7 @@ class UploadManager:
             raise ValueError("not_a_file")
         target.unlink()
 
+    @_synchronized
     def rename_file(self, *, old_name: str, new_name: str) -> str:
         old_safe = sanitize_filename(old_name)
         new_safe = sanitize_filename(new_name)

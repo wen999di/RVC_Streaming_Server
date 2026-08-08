@@ -3,6 +3,16 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 import uuid
+import threading
+import functools
+
+
+def _synchronized(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 def _safe_basename(name: str) -> str:
@@ -34,6 +44,7 @@ class ModelRegistry:
     def __init__(self, base_dir: Path | None = None) -> None:
         self.base_dir = base_dir or Path(__file__).resolve().parent
         self.path = self.base_dir / "model_registry.json"
+        self._lock = threading.RLock()
         self._slots: dict[str, dict] = {}
         self._voice: dict = {"active_id": "", "models": []}
         self._load()
@@ -100,6 +111,7 @@ class ModelRegistry:
             )
         os.replace(tmp, self.path)
 
+    @_synchronized
     def list_slots(self) -> dict:
         out: dict[str, dict] = {}
         for s in SLOTS:
@@ -117,6 +129,7 @@ class ModelRegistry:
             }
         return out
 
+    @_synchronized
     def add_to_slot(self, *, slot: str, filename: str, files_dir: Path) -> dict:
         slot = str(slot).strip()
         slot_def = next((s for s in SLOTS if s.slot == slot), None)
@@ -140,6 +153,7 @@ class ModelRegistry:
         self._save()
         return self.list_slots()[slot]
 
+    @_synchronized
     def activate_in_slot(self, *, slot: str, filename: str) -> dict:
         slot = str(slot).strip()
         filename = _safe_basename(filename)
@@ -152,6 +166,7 @@ class ModelRegistry:
         self._save()
         return self.list_slots()[slot]
 
+    @_synchronized
     def remove_from_slot(self, *, slot: str, filename: str) -> dict:
         slot = str(slot).strip()
         filename = _safe_basename(filename)
@@ -166,9 +181,11 @@ class ModelRegistry:
         self._save()
         return self.list_slots()[slot]
 
+    @_synchronized
     def set_slot(self, *, slot: str, filename: str, files_dir: Path) -> dict:
         return self.add_to_slot(slot=slot, filename=filename, files_dir=files_dir)
 
+    @_synchronized
     def list_voice_models(self) -> dict:
         active_id = str(self._voice.get("active_id") or "")
         models = self._voice.get("models") if isinstance(self._voice.get("models"), list) else []
@@ -187,6 +204,7 @@ class ModelRegistry:
             )
         return {"active_id": active_id, "models": out_models}
 
+    @_synchronized
     def add_voice_model(self, *, name: str, pth: str, index: str, files_dir: Path) -> dict:
         name = str(name or "").strip()
         if not name:
@@ -212,6 +230,7 @@ class ModelRegistry:
         self._save()
         return self.list_voice_models()
 
+    @_synchronized
     def activate_voice_model(self, *, model_id: str) -> dict:
         model_id = str(model_id or "").strip()
         models = self._voice.get("models") if isinstance(self._voice.get("models"), list) else []
@@ -221,6 +240,7 @@ class ModelRegistry:
         self._save()
         return self.list_voice_models()
 
+    @_synchronized
     def remove_voice_model(self, *, model_id: str) -> dict:
         model_id = str(model_id or "").strip()
         models = self._voice.get("models") if isinstance(self._voice.get("models"), list) else []
@@ -231,6 +251,49 @@ class ModelRegistry:
         self._save()
         return self.list_voice_models()
 
+    @_synchronized
+    def remove_file_references(self, *, filename: str) -> dict:
+        filename = _safe_basename(filename)
+        changed = False
+        for slot, state in list(self._slots.items()):
+            if not isinstance(state, dict):
+                continue
+            files = [
+                str(x) for x in state.get("files", [])
+                if isinstance(x, str) and x and x.lower() != filename.lower()
+            ]
+            active = str(state.get("active") or "")
+            if active.lower() == filename.lower():
+                active = files[0] if files else ""
+            if files != state.get("files", []) or active != state.get("active", ""):
+                self._slots[slot] = {"files": files, "active": active}
+                changed = True
+
+        models = self._voice.get("models") if isinstance(self._voice.get("models"), list) else []
+        kept = []
+        removed_ids = set()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            pth = str(model.get("pth") or "")
+            index = str(model.get("index") or "")
+            if pth.lower() == filename.lower():
+                removed_ids.add(str(model.get("id") or ""))
+                changed = True
+                continue
+            if index and index.lower() == filename.lower():
+                model["index"] = ""
+                changed = True
+            kept.append(model)
+        self._voice["models"] = kept
+        if str(self._voice.get("active_id") or "") in removed_ids:
+            self._voice["active_id"] = str(kept[0].get("id") or "") if kept else ""
+            changed = True
+        if changed:
+            self._save()
+        return {"changed": changed}
+
+    @_synchronized
     def rename_file_references(self, *, old_name: str, new_name: str) -> dict:
         old_name = _safe_basename(old_name)
         new_name = _safe_basename(new_name)

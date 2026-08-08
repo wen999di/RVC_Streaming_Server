@@ -3,21 +3,28 @@ import contextlib
 import websockets
 import logging
 import hashlib
+import hmac
 from logging.handlers import RotatingFileHandler
-import struct
 import time
+import threading
+import ssl
 import json
 import os
 import glob
 from pathlib import Path
 from collections.abc import Mapping
 from rvc_core import RVCCore
+from audio_protocol import (
+    AudioInputFrame, FLAG_DISCONTINUITY, build_audio_output_frame, parse_audio_input_frame,
+)
 from file_transfer import UploadManager, parse_file_chunk_frame
 from model_registry import ModelRegistry
 
 # 全局状态
 log_subscribers = set()
-log_queue = asyncio.Queue()
+_ws_send_locks = {}
+log_queue = asyncio.Queue(maxsize=1000)
+_main_loop = None
 upload_manager = UploadManager()
 model_registry = ModelRegistry()
 
@@ -39,16 +46,16 @@ def _compute_config_hash(config: dict) -> str:
     路径仅参与 basename，避免平台差异。
     """
     keys_to_hash = [
-        "model_path", "index_path", "f0_up_key", "block_time", 
-        "crossfade_length", "extra_time", "stream_chunk_ms", 
+        "model_path", "index_path", "f0_up_key", "block_time",
+        "crossfade_length", "extra_time",
         "formant_shift", "f0method", "index_rate", "passthrough",
         "silence_db_threshold", "silence_gate_atten",
         "input_noise_reduce", "output_noise_reduce", "noise_reduce_prop_decrease",
         "rms_mix_rate"
     ]
-    
+
     float_keys = {
-        "block_time", "crossfade_length", "extra_time", 
+        "block_time", "crossfade_length", "extra_time",
         "formant_shift", "index_rate",
         "silence_db_threshold", "silence_gate_atten",
         "noise_reduce_prop_decrease",
@@ -76,7 +83,7 @@ def _compute_config_hash(config: dict) -> str:
             parts.append(f"{k}={s_val}")
         else:
             parts.append(f"{k}={val}")
-            
+
     # 构造确定性的字符串表示。
     raw_str = "|".join(parts)
     return hashlib.md5(raw_str.encode('utf-8')).hexdigest()
@@ -106,7 +113,7 @@ def _try_parse_voice_model_pth_meta(path: Path) -> dict | None:
     except Exception:
         return None
     try:
-        cpt = torch.load(str(path), map_location="cpu")
+        cpt = torch.load(str(path), map_location="cpu", weights_only=True)
         if isinstance(cpt, Mapping) and "model" in cpt and isinstance(cpt.get("model"), Mapping):
             cpt = cpt["model"]
         if not isinstance(cpt, Mapping):
@@ -164,18 +171,27 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # 当前日志文件名包含时间戳。
 CURRENT_LOG_FILE = os.path.join(LOG_DIR, f"server_{time.strftime('%Y-%m-%d_%H-%M-%S')}.log")
 
+def _enqueue_log_message(message: str) -> None:
+    if log_queue.full():
+        try:
+            log_queue.get_nowait()
+            log_queue.task_done()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        log_queue.put_nowait(message)
+    except asyncio.QueueFull:
+        pass
+
+
 class WebSocketLogHandler(logging.Handler):
     """将日志写入 asyncio 队列，用于广播到 WebSocket 订阅者。"""
     def emit(self, record):
         try:
             msg = self.format(record)
-            # 使用 call_soon_threadsafe 入队，避免跨线程直接操作 asyncio.Queue。
-            try:
-                loop = asyncio.get_running_loop()
-                loop.call_soon_threadsafe(log_queue.put_nowait, msg + "\n")
-            except RuntimeError:
-                # 启动/关闭阶段可能没有运行中的 loop。
-                pass
+            loop = _main_loop
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(_enqueue_log_message, msg + "\n")
         except Exception:
             self.handleError(record)
 
@@ -199,6 +215,18 @@ ws_handler = WebSocketLogHandler()
 ws_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 root_logger.addHandler(ws_handler)
 
+async def _ws_send(websocket, payload, *, timeout: float | None = None):
+    lock = _ws_send_locks.get(websocket)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ws_send_locks[websocket] = lock
+    async with lock:
+        send_coro = websocket.send(payload)
+        if timeout is None:
+            return await send_coro
+        return await asyncio.wait_for(send_coro, timeout=timeout)
+
+
 async def log_broadcaster():
     """后台任务：将日志广播给订阅者。"""
     while True:
@@ -207,7 +235,11 @@ async def log_broadcaster():
             # 广播给所有订阅者
             for ws in list(log_subscribers):
                 try:
-                    await ws.send(json.dumps({"status": "ok", "type": "log_chunk", "content": msg}))
+                    await _ws_send(
+                        ws,
+                        json.dumps({"status": "ok", "type": "log_chunk", "content": msg}),
+                        timeout=1.0,
+                    )
                 except Exception:
                     log_subscribers.discard(ws)
         log_queue.task_done()
@@ -216,74 +248,236 @@ async def log_broadcaster():
 class AudioProcessor:
     def __init__(self, config=None):
         self.config = config or {}
+        self._lock = threading.RLock()
         self.core = RVCCore(_resolve_runtime_config(self.config))
         logging.info(f"AudioProcessor initialized with config: {self.config}")
 
     def update_config(self, config):
-        self.config.update(config)
-        self.core.update_config(_resolve_runtime_config(self.config))
-        logging.info(f"Config updated: {self.config}")
- 
+        with self._lock:
+            self.config.update(config)
+            changes = self.core.update_config(_resolve_runtime_config(self.config))
+            logging.info(f"Config updated: {self.config}")
+            return changes
+
+    def reset_stream_state(self):
+        with self._lock:
+            self.core.reset_stream_state()
+
+    def close(self):
+        with self._lock:
+            self.core.close()
+
     def warmup(self):
-        return self.core.warmup()
+        with self._lock:
+            return self.core.warmup()
 
-    def process_frame(self, audio_data, ts_start_ns=None):
-        return self.core.process_frame(audio_data, ts_start_ns)
+    def preload_voice_model(self, model_path: str):
+        with self._lock:
+            return self.core.preload_voice_model(model_path)
 
-async def binary_echo_handler(websocket):
-    logging.info(f"Client connected: {websocket.remote_address}")
+    def process_packet(self, audio_data, ts_start_ns=None):
+        with self._lock:
+            block_bytes = max(4, int(self.core.block_frame) * int(self.core.bytes_per_sample))
+            ns_per_sample = int(self.core.ns_per_sample)
+            results = []
+            for offset in range(0, len(audio_data), block_bytes):
+                chunk = audio_data[offset : offset + block_bytes]
+                chunk_ts = int(ts_start_ns or 0) + (offset // int(self.core.bytes_per_sample)) * ns_per_sample
+                t0 = time.perf_counter()
+                out_pcm, out_ts_ns = self.core.process_frame(chunk, chunk_ts)
+                proc_ms = int(round((time.perf_counter() - t0) * 1000.0))
+                if out_pcm:
+                    results.append((out_pcm, out_ts_ns, proc_ms))
+            return results
 
-    # 1. 为连接初始化音频处理器(等待客户端配置)
-    processor = AudioProcessor()
-    logging.info("Audio Processor Initialized (waiting for client config)")
 
-    loop = asyncio.get_running_loop()
-    # 出站队列容量：按最坏情况 block_time=1000ms, stream_chunk_ms=10ms 计算。
-    # max_chunks = ceil(1000/10) = 100。加点余量 → 128。sender 无节拍，队列平常几乎是空的。
-    # outgoing_queue: (proc_time_ms, enqueue_time_s, ts_ns, audio_chunk)
-    outgoing_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=128)
+class RealtimeAudioSession:
+    def __init__(self, websocket, processor: AudioProcessor):
+        self.websocket = websocket
+        self.processor = processor
+        self.active_session_id = 0
+        self.last_input_sequence = None
+        self.output_sequence = 0
+        self.input_queue = asyncio.Queue(maxsize=max(2, int(os.environ.get("RVC_AUDIO_INPUT_QUEUE", "8"))))
+        self.output_queue = asyncio.Queue(maxsize=max(1, int(os.environ.get("RVC_AUDIO_OUTPUT_QUEUE", "1"))))
+        self.max_input_backlog_samples = max(
+            160,
+            int(16000 * max(20, int(os.environ.get("RVC_MAX_INPUT_BACKLOG_MS", "200"))) / 1000),
+        )
+        self._queued_input_samples = 0
+        self._state_lock = asyncio.Lock()
+        self._worker_task = asyncio.create_task(self._worker_loop())
+        self._sender_task = asyncio.create_task(self._sender_loop())
+        self._pending_discontinuity = False
+        self._output_discontinuity_pending = False
 
-    async def sender_loop():
-        # 无节拍发送：有包即发，不人为延迟。
-        send_count = 0
-        last_diag_time = time.perf_counter()
+    @staticmethod
+    def _drain(queue: asyncio.Queue) -> None:
         while True:
             try:
-                item = await outgoing_queue.get()
-                proc_time, enqueue_time, ts_ns, payload_chunk = item
+                queue.get_nowait()
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                return
 
-                queue_wait_ms = int((time.perf_counter() - enqueue_time) * 1000)
-                if queue_wait_ms > 65535:
-                    queue_wait_ms = 65535
+    def _drain_input(self) -> None:
+        self._drain(self.input_queue)
+        self._queued_input_samples = 0
 
-                header = struct.pack('>HHQ', proc_time, queue_wait_ms, int(ts_ns))
-                final_payload = header + payload_chunk
+    async def reset(self, session_id: int | None = None) -> None:
+        async with self._state_lock:
+            if session_id is not None:
+                self.active_session_id = int(session_id)
+            self.last_input_sequence = None
+            self.output_sequence = 0
+            self._pending_discontinuity = True
+            self._output_discontinuity_pending = True
+            self._drain_input()
+            self._drain(self.output_queue)
+            await asyncio.to_thread(self.processor.reset_stream_state)
 
-                try:
-                    await websocket.send(final_payload)
-                except Exception as e:
-                    logging.error(f"发送失败: {e}")
-                finally:
-                    outgoing_queue.task_done()
+    async def apply_config(self, cfg: dict) -> dict:
+        async with self._state_lock:
+            changes = await asyncio.to_thread(self.processor.update_config, cfg)
+            if changes.get("buffer_layout") or changes.get("model_runtime"):
+                self.last_input_sequence = None
+                self.output_sequence = 0
+                self._pending_discontinuity = True
+                self._output_discontinuity_pending = True
+                self._drain_input()
+                self._drain(self.output_queue)
+                await asyncio.to_thread(self.processor.reset_stream_state)
+            should_warmup = bool(changes.get("model_runtime"))
+            if should_warmup and not self.processor.core.passthrough and self.processor.core.model_path:
+                await asyncio.to_thread(self.processor.warmup)
+            return changes
 
-                send_count += 1
-                now = time.perf_counter()
-                if now - last_diag_time > 10.0:
-                    qs = outgoing_queue.qsize()
-                    logging.info(f"sender 诊断: 10s 内发送 {send_count} 包, 当前队列 {qs}, 队列等待 {queue_wait_ms}ms")
-                    send_count = 0
-                    last_diag_time = now
+    async def enqueue(self, frame: AudioInputFrame) -> None:
+        if not self.active_session_id or frame.session_id != self.active_session_id:
+            return
 
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logging.exception(f"sender_loop 异常，尝试恢复: {exc}")
-                await asyncio.sleep(0.1)
+        sample_count = len(frame.payload) // 4
+        dropped = False
+        if sample_count > self.max_input_backlog_samples:
+            drop_samples = sample_count - self.max_input_backlog_samples
+            frame = AudioInputFrame(
+                session_id=frame.session_id,
+                sequence=frame.sequence,
+                sample_rate=frame.sample_rate,
+                timestamp_ns=frame.timestamp_ns + drop_samples * (1_000_000_000 // 16000),
+                flags=frame.flags | FLAG_DISCONTINUITY,
+                payload=frame.payload[drop_samples * 4 :],
+            )
+            sample_count = self.max_input_backlog_samples
+            dropped = True
 
-    sender_task = asyncio.create_task(sender_loop())
-    last_backlog_log_ts = 0.0
-    empty_out_streak = 0
-    last_empty_out_log_ts = 0.0
+        while self.input_queue.full() or self._queued_input_samples + sample_count > self.max_input_backlog_samples:
+            try:
+                old_frame, _ = self.input_queue.get_nowait()
+                self.input_queue.task_done()
+                self._queued_input_samples = max(0, self._queued_input_samples - len(old_frame.payload) // 4)
+                dropped = True
+            except asyncio.QueueEmpty:
+                break
+
+        if dropped:
+            # The next worker iteration will reset inference state and then mark
+            # its first generated output discontinuous.
+            self._pending_discontinuity = True
+        self.input_queue.put_nowait((frame, time.perf_counter()))
+        self._queued_input_samples += sample_count
+
+    async def _worker_loop(self) -> None:
+        while True:
+            frame, enqueue_time = await self.input_queue.get()
+            self._queued_input_samples = max(0, self._queued_input_samples - len(frame.payload) // 4)
+            try:
+                if frame.session_id != self.active_session_id:
+                    continue
+                input_queue_ms = int(round((time.perf_counter() - enqueue_time) * 1000.0))
+                async with self._state_lock:
+                    if frame.session_id != self.active_session_id:
+                        continue
+                    discontinuity = self._pending_discontinuity or bool(frame.flags & FLAG_DISCONTINUITY)
+                    expected = None if self.last_input_sequence is None else ((self.last_input_sequence + 1) & 0xFFFFFFFF)
+                    if expected is not None and frame.sequence != expected:
+                        discontinuity = True
+                    if discontinuity:
+                        await asyncio.to_thread(self.processor.reset_stream_state)
+                        self._pending_discontinuity = False
+                        self._output_discontinuity_pending = True
+                    self.last_input_sequence = frame.sequence
+                    outputs = await asyncio.to_thread(
+                        self.processor.process_packet, frame.payload, frame.timestamp_ns
+                    )
+                    if frame.session_id != self.active_session_id:
+                        continue
+
+                for out_pcm, out_ts_ns, proc_ms in outputs:
+                    dropped_output = False
+                    while self.output_queue.full():
+                        try:
+                            self.output_queue.get_nowait()
+                            self.output_queue.task_done()
+                            dropped_output = True
+                        except asyncio.QueueEmpty:
+                            break
+
+                    flags = FLAG_DISCONTINUITY if (self._output_discontinuity_pending or dropped_output) else 0
+                    self._output_discontinuity_pending = False
+                    item = (
+                        frame.session_id, self.output_sequence, int(out_ts_ns or 0), proc_ms,
+                        input_queue_ms, flags, out_pcm, time.perf_counter(),
+                    )
+                    self.output_sequence = (self.output_sequence + 1) & 0xFFFFFFFF
+                    self.output_queue.put_nowait(item)
+            finally:
+                self.input_queue.task_done()
+
+    async def _sender_loop(self) -> None:
+        while True:
+            item = await self.output_queue.get()
+            try:
+                session_id, sequence, ts_ns, proc_ms, input_queue_ms, flags, payload, enqueue_time = item
+                if session_id != self.active_session_id:
+                    continue
+                output_queue_ms = int(round((time.perf_counter() - enqueue_time) * 1000.0))
+                frame = build_audio_output_frame(
+                    session_id=session_id, sequence=sequence, sample_rate=16000,
+                    timestamp_ns=ts_ns, proc_ms=proc_ms, input_queue_ms=input_queue_ms,
+                    output_queue_ms=output_queue_ms, flags=flags, payload=payload,
+                )
+                await _ws_send(self.websocket, frame)
+            finally:
+                self.output_queue.task_done()
+
+    async def close(self) -> None:
+        for task in (self._worker_task, self._sender_task):
+            task.cancel()
+        for task in (self._worker_task, self._sender_task):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._drain_input()
+        self._drain(self.output_queue)
+
+
+async def binary_echo_handler(websocket):
+    path = str(getattr(websocket, "path", "/") or "/")
+    role = "audio" if path.rstrip("/").endswith("/audio") else "control"
+
+    expected_token = os.environ.get("RVC_STREAMING_TOKEN", "")
+    if expected_token:
+        auth = str(websocket.request_headers.get("Authorization", ""))
+        provided = auth[7:] if auth.startswith("Bearer ") else ""
+        if not provided or not hmac.compare_digest(provided, expected_token):
+            logging.warning(f"Rejected unauthorized {role} client: {websocket.remote_address}")
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
+
+    logging.info(f"Client connected: role={role} remote={websocket.remote_address}")
+    processor = AudioProcessor()
+    audio_session = RealtimeAudioSession(websocket, processor) if role == "audio" else None
+    logging.info(f"Audio Processor initialized for role={role}")
 
     def _abs_voice_model_path(filename: str) -> str:
         base = os.path.basename(str(filename or ""))
@@ -327,7 +521,7 @@ async def binary_echo_handler(websocket):
     async def _send_voice_models() -> None:
         voice = await asyncio.to_thread(model_registry.list_voice_models)
         voice = _attach_voice_runtime_state(voice)
-        await websocket.send(
+        await _ws_send(websocket,
             json.dumps(
                 {
                     "status": "ok",
@@ -344,19 +538,53 @@ async def binary_echo_handler(websocket):
                 # JSON 配置消息或命令
                 try:
                     data = json.loads(message)
-                    
+
+                    command = str(data.get("command") or "")
+                    has_config = "config" in data
+                    audio_commands = {"stream_start", "stream_stop"}
+                    if role == "audio" and not (has_config or command in audio_commands):
+                        await _ws_send(websocket, json.dumps({
+                            "status": "error", "type": "endpoint_error",
+                            "message": "command_not_allowed_on_audio_endpoint",
+                        }))
+                        continue
+                    if role == "control" and (has_config or command in audio_commands):
+                        await _ws_send(websocket, json.dumps({
+                            "status": "error", "type": "endpoint_error",
+                            "message": "audio_endpoint_required",
+                        }))
+                        continue
+
+                    if command == "stream_start":
+                        if audio_session is None:
+                            await _ws_send(websocket, json.dumps({"status": "error", "type": "stream_error", "message": "audio_endpoint_required"}))
+                            continue
+                        session_id = int(data.get("session_id") or 0)
+                        if session_id <= 0:
+                            await _ws_send(websocket, json.dumps({"status": "error", "type": "stream_error", "message": "invalid_session_id"}))
+                            continue
+                        await audio_session.reset(session_id)
+                        await _ws_send(websocket, json.dumps({"status": "ok", "type": "stream_started", "session_id": session_id, "protocol": 2}))
+
+                    elif command == "stream_stop":
+                        if audio_session is not None:
+                            session_id = int(data.get("session_id") or 0)
+                            if not session_id or session_id == audio_session.active_session_id:
+                                await audio_session.reset(0)
+                        await _ws_send(websocket, json.dumps({"status": "ok", "type": "stream_stopped"}))
+
                     # 1. 配置更新
-                    if "config" in data:
+                    elif "config" in data:
                         cfg = data["config"] if isinstance(data.get("config"), dict) else {}
                         seq = data.get("seq", None)
                         passthrough = bool(cfg.get("passthrough", False))
-                        
+
                         # 校验音色模型文件存在（路径解析统一由 _resolve_runtime_config 处理）
                         if "model_path" in cfg and not passthrough:
                             client_pth = os.path.basename(str(cfg.get("model_path") or ""))
                             if not client_pth or not (upload_manager.files_dir / client_pth).is_file():
                                 logging.error(f"Config Error: Voice model not found. client_pth={client_pth}")
-                                await websocket.send(
+                                await _ws_send(websocket,
                                     json.dumps(
                                         {
                                             "status": "error",
@@ -375,30 +603,26 @@ async def binary_echo_handler(websocket):
                         # 注入 Registry 中的基模路径 (Hubert/RMVPE)
                         try:
                             slots_info = await asyncio.to_thread(model_registry.list_slots)
-                            
+
                             hubert_info = slots_info.get("hubert_base", {})
-                            hubert_file = hubert_info.get("active", "")
-                            if hubert_file:
-                                hubert_full = upload_manager.files_dir / hubert_file
-                                if hubert_full.exists():
-                                    cfg["hubert_path"] = hubert_file
-                            
+                            hubert_file = str(hubert_info.get("active", "") or "")
+                            hubert_full = upload_manager.files_dir / hubert_file if hubert_file else None
+                            cfg["hubert_path"] = hubert_file if hubert_full and hubert_full.is_file() else ""
+
                             rmvpe_info = slots_info.get("rmvpe", {})
-                            rmvpe_file = rmvpe_info.get("active", "")
-                            if rmvpe_file:
-                                rmvpe_full = upload_manager.files_dir / rmvpe_file
-                                if rmvpe_full.exists():
-                                    cfg["rmvpe_path"] = rmvpe_file
+                            rmvpe_file = str(rmvpe_info.get("active", "") or "")
+                            rmvpe_full = upload_manager.files_dir / rmvpe_file if rmvpe_file else None
+                            cfg["rmvpe_path"] = rmvpe_file if rmvpe_full and rmvpe_full.is_file() else ""
                         except Exception as e:
                             logging.error(f"Error resolving base models: {e}")
 
                         try:
-                            processor.update_config(cfg)
-                            if not bool(getattr(processor.core, "passthrough", False)) and processor.core.model_path:
-                                await asyncio.to_thread(processor.warmup)
+                            if audio_session is None:
+                                raise RuntimeError("audio_endpoint_required")
+                            changes = await audio_session.apply_config(cfg)
                         except Exception as e:
                             logging.error(f"Config Error: warmup failed: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -413,6 +637,7 @@ async def binary_echo_handler(websocket):
 
                         effective_block_ms = int(round(processor.core.block_frame * 1000.0 / processor.core.sr))
                         effective_crossfade_ms = int(round(processor.core.crossfade_frame * 1000.0 / processor.core.sr))
+                        effective_sola_ms = int(round(processor.core.sola_buffer_frame * 1000.0 / processor.core.sr))
                         response = {
                             "status": "ok",
                             "type": "config_ack",
@@ -421,34 +646,35 @@ async def binary_echo_handler(websocket):
                             "effective": {
                                 "block_ms": effective_block_ms,
                                 "crossfade_ms": effective_crossfade_ms,
+                                "sola_overlap_ms": effective_sola_ms,
                             },
                         }
                         if isinstance(seq, int):
                             response["seq"] = seq
-                        await websocket.send(json.dumps(response))
-                    
+                        await _ws_send(websocket, json.dumps(response))
+
                     # 2. 获取日志列表命令
                     elif "command" in data and data["command"] == "list_logs":
                         try:
                             # Use glob to find all files ending in .log
                             log_files = glob.glob(os.path.join(LOG_DIR, "*.log"))
-                            
+
                             # Sort by modification time, newest first
                             log_files.sort(key=os.path.getmtime, reverse=True)
-                            
+
                             # Extract just the filename
                             log_filenames = [os.path.basename(f) for f in log_files]
-                            
+
                             response = {
-                                "status": "ok", 
-                                "type": "log_list", 
+                                "status": "ok",
+                                "type": "log_list",
                                 "files": log_filenames,
                                 "current": os.path.basename(CURRENT_LOG_FILE)
                             }
-                            await websocket.send(json.dumps(response))
+                            await _ws_send(websocket, json.dumps(response))
                         except Exception as e:
                             logging.error(f"Error listing logs: {e}", exc_info=True)
-                            await websocket.send(json.dumps({"status": "error", "message": f"List logs error: {str(e)}"}))
+                            await _ws_send(websocket, json.dumps({"status": "error", "message": f"List logs error: {str(e)}"}))
 
                     # 3. 清空历史日志命令
                     elif "command" in data and data["command"] == "clear_old_logs":
@@ -467,7 +693,7 @@ async def binary_echo_handler(websocket):
                             # 返回更新后的日志列表
                             remaining = glob.glob(os.path.join(LOG_DIR, "*.log"))
                             remaining.sort(key=os.path.getmtime, reverse=True)
-                            await websocket.send(json.dumps({
+                            await _ws_send(websocket, json.dumps({
                                 "status": "ok",
                                 "type": "log_list",
                                 "files": [os.path.basename(f) for f in remaining],
@@ -475,38 +701,38 @@ async def binary_echo_handler(websocket):
                             }))
                         except Exception as e:
                             logging.error(f"Error clearing logs: {e}", exc_info=True)
-                            await websocket.send(json.dumps({"status": "error", "message": f"Clear logs error: {str(e)}"}))
+                            await _ws_send(websocket, json.dumps({"status": "error", "message": f"Clear logs error: {str(e)}"}))
 
                     # 4. 读取日志内容命令
                     elif "command" in data and data["command"] == "read_log":
                         filename = data.get("filename")
                         # 如果没有指定文件名，或文件名是 special token "current"，则读取当前日志
                         target_file = CURRENT_LOG_FILE
-                        
+
                         if filename and filename != "current":
                             # 安全检查：防止路径遍历
                             safe_name = os.path.basename(filename)
                             target_file = os.path.join(LOG_DIR, safe_name)
-                        
+
                         try:
                             if os.path.exists(target_file):
                                 with open(target_file, 'r', encoding='utf-8') as f:
                                     content = f.read()
-                                    
+
                                 response = {
                                     "status": "ok",
                                     "type": "log_content",
                                     "filename": os.path.basename(target_file),
                                     "content": content
                                 }
-                                await websocket.send(json.dumps(response))
+                                await _ws_send(websocket, json.dumps(response))
                             else:
                                 logging.error(f"Read Log Error: File not found: {target_file}")
-                                await websocket.send(json.dumps({"status": "error", "message": "File not found"}))
+                                await _ws_send(websocket, json.dumps({"status": "error", "message": "File not found"}))
                         except Exception as e:
                             logging.error(f"Error reading log: {e}", exc_info=True)
-                            await websocket.send(json.dumps({"status": "error", "message": f"Read log error: {str(e)}"}))
-                            
+                            await _ws_send(websocket, json.dumps({"status": "error", "message": f"Read log error: {str(e)}"}))
+
                     # 5. 实时日志订阅命令
                     elif "command" in data and data["command"] == "watch_log":
                         action = data.get("action")
@@ -517,7 +743,7 @@ async def binary_echo_handler(websocket):
                                     with open(CURRENT_LOG_FILE, 'r', encoding='utf-8') as f:
                                         content = f.read()
                                     # 发送基础内容
-                                    await websocket.send(json.dumps({
+                                    await _ws_send(websocket, json.dumps({
                                         "status": "ok",
                                         "type": "log_content",
                                         "filename": os.path.basename(CURRENT_LOG_FILE),
@@ -525,20 +751,20 @@ async def binary_echo_handler(websocket):
                                     }))
                             except Exception as e:
                                 logging.error(f"Error reading initial log: {e}")
-                            
+
                             # 2. 加入订阅列表
                             log_subscribers.add(websocket)
-                            await websocket.send(json.dumps({"status": "ok", "message": "Log watch started"}))
-                            
+                            await _ws_send(websocket, json.dumps({"status": "ok", "message": "Log watch started"}))
+
                         elif action == "stop":
                             log_subscribers.discard(websocket)
-                            await websocket.send(json.dumps({"status": "ok", "message": "Log watch stopped"}))
-                            
+                            await _ws_send(websocket, json.dumps({"status": "ok", "message": "Log watch stopped"}))
+
                     # 5. Ping 命令 (用于精确测量 RTT)
                     elif "command" in data and data["command"] == "ping":
                         client_ts = data.get("ts", 0)
                         # 直接回 Pong
-                        await websocket.send(json.dumps({
+                        await _ws_send(websocket, json.dumps({
                             "type": "pong",
                             "client_ts": client_ts,
                             "server_ts": time.perf_counter() * 1000
@@ -550,7 +776,7 @@ async def binary_echo_handler(websocket):
                             files = await asyncio.to_thread(
                                 _enrich_files_with_voice_meta, files, upload_manager.files_dir
                             )
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -561,7 +787,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Files List Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -574,19 +800,20 @@ async def binary_echo_handler(websocket):
                     elif "command" in data and data["command"] == "files_delete":
                         try:
                             name = data.get("name", "")
+                            safe_name = os.path.basename(str(name))
                             await asyncio.to_thread(upload_manager.delete_file, name=name)
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "status": "ok",
-                                        "type": "files_deleted",
-                                        "name": os.path.basename(str(name)),
-                                    }
-                                )
-                            )
+                            await asyncio.to_thread(model_registry.remove_file_references, filename=safe_name)
+                            await _ws_send(websocket, json.dumps({
+                                "status": "ok", "type": "files_deleted", "name": safe_name,
+                            }))
+                            slots = await asyncio.to_thread(model_registry.list_slots)
+                            await _ws_send(websocket, json.dumps({
+                                "status": "ok", "type": "model_slots", "slots": slots,
+                            }))
+                            await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Files Delete Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -610,7 +837,7 @@ async def binary_echo_handler(websocket):
                                 new_name=new_safe,
                             )
 
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -622,7 +849,7 @@ async def binary_echo_handler(websocket):
                             )
 
                             slots = await asyncio.to_thread(model_registry.list_slots)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -632,7 +859,7 @@ async def binary_echo_handler(websocket):
                                 )
                             )
                             voice = await asyncio.to_thread(model_registry.list_voice_models)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -643,7 +870,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Files Rename Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -656,7 +883,7 @@ async def binary_echo_handler(websocket):
                     elif "command" in data and data["command"] == "model_list_slots":
                         try:
                             slots = await asyncio.to_thread(model_registry.list_slots)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -667,7 +894,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Model List Slots Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -687,7 +914,7 @@ async def binary_echo_handler(websocket):
                                 filename=filename,
                                 files_dir=upload_manager.files_dir,
                             )
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -699,7 +926,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Model Add To Slot Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -716,7 +943,7 @@ async def binary_echo_handler(websocket):
                             slot_state = await asyncio.to_thread(
                                 model_registry.activate_in_slot, slot=slot, filename=filename
                             )
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -728,7 +955,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Model Activate In Slot Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -745,7 +972,7 @@ async def binary_echo_handler(websocket):
                             slot_state = await asyncio.to_thread(
                                 model_registry.remove_from_slot, slot=slot, filename=filename
                             )
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -757,7 +984,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Model Remove From Slot Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -777,7 +1004,7 @@ async def binary_echo_handler(websocket):
                                 filename=filename,
                                 files_dir=upload_manager.files_dir,
                             )
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -789,7 +1016,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Model Set Slot Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -804,7 +1031,7 @@ async def binary_echo_handler(websocket):
                             await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Voice Model List Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -829,7 +1056,7 @@ async def binary_echo_handler(websocket):
                             await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Voice Model Add Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -848,7 +1075,7 @@ async def binary_echo_handler(websocket):
                             await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Voice Model Activate Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -867,7 +1094,7 @@ async def binary_echo_handler(websocket):
                             await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Voice Model Remove Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -900,11 +1127,16 @@ async def binary_echo_handler(websocket):
                             if not model_pth or not os.path.exists(model_pth):
                                 raise FileNotFoundError("file_not_found_pth")
 
-                            await asyncio.to_thread(processor.core.preload_voice_model, model_pth)
+                            slots_info = await asyncio.to_thread(model_registry.list_slots)
+                            hubert_file = str(slots_info.get("hubert_base", {}).get("active", "") or "")
+                            preload_cfg = {"hubert_path": hubert_file} if hubert_file else {}
+                            if preload_cfg:
+                                await asyncio.to_thread(processor.update_config, preload_cfg)
+                            await asyncio.to_thread(processor.preload_voice_model, model_pth)
                             await _send_voice_models()
                         except Exception as e:
                             logging.error(f"Voice Model Preload Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -925,7 +1157,7 @@ async def binary_echo_handler(websocket):
                                 size=size,
                                 sha256=sha256,
                             )
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -939,7 +1171,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Upload Init Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -955,7 +1187,7 @@ async def binary_echo_handler(websocket):
                             meta, final_name = await asyncio.to_thread(
                                 upload_manager.finish_sync, upload_id=upload_id
                             )
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -967,7 +1199,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Upload Finish Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -981,7 +1213,7 @@ async def binary_echo_handler(websocket):
                         try:
                             upload_id = str(data.get("upload_id", "")).strip()
                             await asyncio.to_thread(upload_manager.abort_sync, upload_id=upload_id)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "ok",
@@ -992,7 +1224,7 @@ async def binary_echo_handler(websocket):
                             )
                         except Exception as e:
                             logging.error(f"Upload Abort Error: {e}", exc_info=True)
-                            await websocket.send(
+                            await _ws_send(websocket,
                                 json.dumps(
                                     {
                                         "status": "error",
@@ -1005,148 +1237,77 @@ async def binary_echo_handler(websocket):
                     else:
                         logging.error(f"Invalid config or command: {data}")
                         response = {"status": "error", "message": "Invalid config or command"}
-                        await websocket.send(json.dumps(response))
+                        await _ws_send(websocket, json.dumps(response))
                 except json.JSONDecodeError as e:
                     logging.error(f"JSON decode error: {e}", exc_info=True)
                     response = {"status": "error", "message": f"JSON decode error: {str(e)}"}
-                    await websocket.send(json.dumps(response))
-                    
+                    await _ws_send(websocket, json.dumps(response))
+
             elif isinstance(message, bytes):
+                if role == "audio":
+                    if audio_session is None:
+                        continue
+                    try:
+                        frame = parse_audio_input_frame(message)
+                        if frame is None:
+                            raise ValueError("invalid_audio_frame_magic")
+                        await audio_session.enqueue(frame)
+                    except Exception as e:
+                        logging.warning(f"Invalid audio frame: {e}")
+                        await _ws_send(websocket, json.dumps({
+                            "status": "error", "type": "stream_error", "message": str(e)
+                        }))
+                    continue
+
+                # Control connection binary frames are reserved for resumable file upload.
                 try:
                     parsed = parse_file_chunk_frame(message)
+                    if parsed is None:
+                        raise ValueError("unsupported_control_binary_frame")
                 except Exception as e:
-                    logging.error(f"Parse File Chunk Error: {e}", exc_info=True)
-                    await websocket.send(
-                        json.dumps(
-                            {
-                                "status": "error",
-                                "type": "upload_error",
-                                "message": str(e),
-                            }
-                        )
+                    logging.error(f"Parse File Chunk Error: {e}")
+                    await _ws_send(websocket, json.dumps({
+                        "status": "error", "type": "upload_error", "message": str(e)
+                    }))
+                    continue
+
+                upload_uuid, offset, payload = parsed
+                upload_id = str(upload_uuid)
+                try:
+                    meta = await asyncio.to_thread(
+                        upload_manager.write_chunk_sync,
+                        upload_id=upload_id, offset=int(offset), payload=payload,
                     )
-                    continue
+                    await _ws_send(websocket, json.dumps({
+                        "status": "ok", "type": "upload_progress",
+                        "upload_id": meta.upload_id, "name": meta.name,
+                        "received_bytes": meta.received_bytes, "total_bytes": meta.size,
+                    }))
+                except Exception as e:
+                    msg = str(e)
+                    if msg.startswith("offset_mismatch:"):
+                        expected = int(msg.split(":", 1)[1])
+                        await _ws_send(websocket, json.dumps({
+                            "status": "error", "type": "upload_offset_mismatch",
+                            "upload_id": upload_id, "expected_offset": expected,
+                        }))
+                    else:
+                        logging.error(f"Upload Chunk Write Error: {e}", exc_info=True)
+                        await _ws_send(websocket, json.dumps({
+                            "status": "error", "type": "upload_error",
+                            "upload_id": upload_id, "message": msg,
+                        }))
 
-                if parsed is not None:
-                    upload_uuid, offset, payload = parsed
-                    upload_id = str(upload_uuid)
-                    try:
-                        meta = await asyncio.to_thread(
-                            upload_manager.write_chunk_sync,
-                            upload_id=upload_id,
-                            offset=int(offset),
-                            payload=payload,
-                        )
-                        await websocket.send(
-                            json.dumps(
-                                {
-                                    "status": "ok",
-                                    "type": "upload_progress",
-                                    "upload_id": meta.upload_id,
-                                    "name": meta.name,
-                                    "received_bytes": meta.received_bytes,
-                                    "total_bytes": meta.size,
-                                }
-                            )
-                        )
-                    except Exception as e:
-                        msg = str(e)
-                        if msg.startswith("offset_mismatch:"):
-                            expected = int(msg.split(":", 1)[1])
-                            logging.warning(f"Upload Offset Mismatch: upload_id={upload_id}, expected={expected}")
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "status": "error",
-                                        "type": "upload_offset_mismatch",
-                                        "upload_id": upload_id,
-                                        "expected_offset": expected,
-                                    }
-                                )
-                            )
-                        else:
-                            logging.error(f"Upload Chunk Write Error: {e}", exc_info=True)
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "status": "error",
-                                        "type": "upload_error",
-                                        "upload_id": upload_id,
-                                        "message": msg,
-                                    }
-                                )
-                            )
-                    continue
-
-                if len(message) < 8:
-                    continue
-                ts_start_ns = struct.unpack(">Q", message[:8])[0]
-                audio_payload = message[8:]
-
-                def _process_with_timing(pcm_bytes, ts_ns):
-                    t0 = time.perf_counter()
-                    out_pcm, out_ts_ns = processor.process_frame(pcm_bytes, ts_ns)
-                    proc_ms = int(round((time.perf_counter() - t0) * 1000.0))
-                    return out_pcm, out_ts_ns, proc_ms
-
-                processed_audio, out_start_ns, proc_time_ms = await loop.run_in_executor(
-                    None, _process_with_timing, audio_payload, ts_start_ns
-                )
-
-                if not processed_audio:
-                    empty_out_streak += 1
-                    now = time.perf_counter()
-                    if now - last_empty_out_log_ts > 2.0 and empty_out_streak >= 20:
-                        logging.warning(
-                            f"输出为空（连续 {empty_out_streak} 次），block_frame={int(processor.core.block_frame)} pending={int(processor.core.pending_samples)}"
-                        )
-                        last_empty_out_log_ts = now
-                    continue
-                empty_out_streak = 0
-
-                stream_chunk_ms = int(processor.config.get("stream_chunk_ms") or 20)
-                if stream_chunk_ms <= 0:
-                    stream_chunk_ms = 20
-                
-                # Calculate bytes based on output sampling rate
-                output_sr = getattr(processor.core, "output_sr", 16000)
-                bytes_per_sample = getattr(processor.core, "bytes_per_sample", 4)
-                bytes_per_ms = int(output_sr * bytes_per_sample / 1000)
-                chunk_bytes = max(bytes_per_sample, stream_chunk_ms * bytes_per_ms)
-                chunk_bytes = (chunk_bytes // bytes_per_sample) * bytes_per_sample
-
-                for offset in range(0, len(processed_audio), chunk_bytes):
-                    chunk = processed_audio[offset : offset + chunk_bytes]
-                    out_proc = proc_time_ms
-                    offset_samples = offset // bytes_per_sample
-                    
-                    # Timestamp calculation depends on output_sr
-                    ns_per_sample = 1_000_000_000 / output_sr
-                    chunk_ts_ns = int(out_start_ns or 0) + int(offset_samples * ns_per_sample)
-                    
-                    # 记录入队时间，用于计算在输出队列中的等待时间
-                    enqueue_time = time.perf_counter()
-
-                    # 使用 await put() 而非 put_nowait()：
-                    # 1. 自然 yield 给事件循环，让 sender 有机会运行
-                    # 2. 队列满(128)时背压推理输出，而非丢弃音频
-                    await outgoing_queue.put((out_proc, enqueue_time, chunk_ts_ns, chunk))
-                
-                # 队列积压监控（阈值 96，容量 128 的 75%）
-                queue_size = outgoing_queue.qsize()
-                if queue_size > 96:
-                    now = time.perf_counter()
-                    if now - last_backlog_log_ts > 5.0:
-                        logging.warning(f"输出队列积压: {queue_size} 包")
-                        last_backlog_log_ts = now
-                
     except websockets.exceptions.ConnectionClosed:
         logging.info("Client disconnected")
     except Exception as e:
         logging.exception(f"Error in binary_echo_handler: {e}")
     finally:
         log_subscribers.discard(websocket)
-        sender_task.cancel()
+        if audio_session is not None:
+            await audio_session.close()
+        await asyncio.to_thread(processor.close)
+        _ws_send_locks.pop(websocket, None)
 
 def _preload_base_models() -> None:
     """服务器启动时预加载 Hubert Base（所有音色共用），减少首次推理延迟。"""
@@ -1178,15 +1339,54 @@ def _preload_base_models() -> None:
 
 
 async def main():
-    # 后台预加载 Hubert Base 和 RMVPE，减少首次加载模型时的延迟
-    loop = asyncio.get_event_loop()
+    global _main_loop
+    bind_host = os.environ.get("RVC_STREAMING_BIND", "127.0.0.1").strip() or "127.0.0.1"
+    bind_port = int(os.environ.get("RVC_STREAMING_PORT", "8765"))
+    token = os.environ.get("RVC_STREAMING_TOKEN", "")
+    loopback_hosts = {"127.0.0.1", "::1", "localhost"}
+    is_loopback = bind_host in loopback_hosts
+    if not is_loopback and not token:
+        raise RuntimeError(
+            "Refusing non-loopback bind without RVC_STREAMING_TOKEN. "
+            "Set a strong shared token or bind only to localhost."
+        )
+
+    tls_context = None
+    cert_path = os.environ.get("RVC_TLS_CERT", "").strip()
+    key_path = os.environ.get("RVC_TLS_KEY", "").strip()
+    if cert_path or key_path:
+        if not cert_path or not key_path:
+            raise RuntimeError("Both RVC_TLS_CERT and RVC_TLS_KEY are required for TLS")
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    elif not is_loopback and os.environ.get("RVC_ALLOW_INSECURE_WS", "").strip() != "1":
+        raise RuntimeError(
+            "Refusing clear-text remote WebSocket. Configure RVC_TLS_CERT/RVC_TLS_KEY, "
+            "or set RVC_ALLOW_INSECURE_WS=1 only on a trusted private network."
+        )
+
+    loop = asyncio.get_running_loop()
+    _main_loop = loop
     loop.run_in_executor(None, _preload_base_models)
 
-    # max_size=None 允许大包传输
     broadcaster_task = asyncio.create_task(log_broadcaster())
     try:
-        async with websockets.serve(binary_echo_handler, "0.0.0.0", 8765, max_size=None):
-            logging.info("Binary RVC Server running on :8765")
+        async with websockets.serve(
+            binary_echo_handler,
+            bind_host,
+            bind_port,
+            max_size=2 * 1024 * 1024,
+            max_queue=4,
+            compression=None,
+            ping_interval=20,
+            ping_timeout=20,
+            ssl=tls_context,
+        ):
+            logging.info(
+                f"RVC Server listening on {'wss' if tls_context else 'ws'}://{bind_host}:{bind_port} "
+                f"(auth={'enabled' if token else 'local-only'})"
+            )
             await asyncio.get_running_loop().create_future()
     finally:
         broadcaster_task.cancel()

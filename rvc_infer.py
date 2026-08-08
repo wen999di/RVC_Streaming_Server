@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections import OrderedDict
 from typing import Optional
+import threading
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -28,43 +29,104 @@ class LoadedModelInfo:
     version: str
  
  
-_HUBERT_CACHE: dict[tuple[str, bool, str], torch.nn.Module] = {}
-_RMVPE_CACHE: dict[tuple[str, bool, str], object] = {}
+def _file_identity(path: str) -> tuple[str, int, int]:
+    resolved = Path(path).resolve()
+    st = resolved.stat()
+    return str(resolved), int(st.st_mtime_ns), int(st.st_size)
+
+
+_HUBERT_CACHE: "OrderedDict[tuple, torch.nn.Module]" = OrderedDict()
+_RMVPE_CACHE: "OrderedDict[tuple, object]" = OrderedDict()
 _FCPE_CACHE: dict[str, object] = {}
+_SHARED_NET_G_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_SHARED_NET_G_LOCK = threading.RLock()
+_SHARED_NET_G_MAX = max(1, int(os.environ.get("RVC_MODEL_CACHE_SIZE", "4")))
+_DEVICE_INFER_LOCKS: dict[str, threading.Lock] = {}
+_DEVICE_INFER_LOCKS_GUARD = threading.Lock()
+_COMPONENT_CACHE_LOCK = threading.RLock()
+_BASE_MODEL_CACHE_MAX = max(1, int(os.environ.get("RVC_BASE_MODEL_CACHE_SIZE", "2")))
+_INDEX_CACHE_MAX = max(1, int(os.environ.get("RVC_INDEX_CACHE_SIZE", "4")))
+_FAISS_CACHE: "OrderedDict[tuple, tuple[object, object, object | None]]" = OrderedDict()
+
+
+def _device_infer_lock(device: torch.device) -> threading.Lock:
+    key = str(device)
+    with _DEVICE_INFER_LOCKS_GUARD:
+        lock = _DEVICE_INFER_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _DEVICE_INFER_LOCKS[key] = lock
+        return lock
 
 
 def _load_rmvpe(device: torch.device, is_half: bool, rmvpe_path: str):
-    key = (str(device), bool(is_half), str(rmvpe_path))
-    cached = _RMVPE_CACHE.get(key)
-    if cached is not None:
-        return cached
-    from rmvpe import RMVPE
-    instance = RMVPE(rmvpe_path, is_half=is_half, device=device, use_jit=False)
-    _RMVPE_CACHE[key] = instance
-    return instance
+    key = (str(device), bool(is_half), *_file_identity(rmvpe_path))
+    with _COMPONENT_CACHE_LOCK:
+        cached = _RMVPE_CACHE.get(key)
+        if cached is not None:
+            _RMVPE_CACHE.move_to_end(key)
+            return cached
+        from rmvpe import RMVPE
+        instance = RMVPE(rmvpe_path, is_half=is_half, device=device, use_jit=False)
+        _RMVPE_CACHE[key] = instance
+        _RMVPE_CACHE.move_to_end(key)
+        while len(_RMVPE_CACHE) > _BASE_MODEL_CACHE_MAX:
+            _RMVPE_CACHE.popitem(last=False)
+        return instance
 
 
 def _load_fcpe(device: torch.device):
     key = str(device)
-    cached = _FCPE_CACHE.get(key)
-    if cached is not None:
-        return cached
-    from torchfcpe import spawn_bundled_infer_model
-    model = spawn_bundled_infer_model(device)
-    _FCPE_CACHE[key] = model
-    return model
+    with _COMPONENT_CACHE_LOCK:
+        cached = _FCPE_CACHE.get(key)
+        if cached is not None:
+            return cached
+        from torchfcpe import spawn_bundled_infer_model
+        model = spawn_bundled_infer_model(device)
+        _FCPE_CACHE[key] = model
+        return model
  
- 
+
 def _load_hubert(device: torch.device, is_half: bool, hubert_path: str) -> torch.nn.Module:
-    key = (str(device), bool(is_half), str(hubert_path))
-    cached = _HUBERT_CACHE.get(key)
-    if cached is not None:
-        return cached
- 
-    from hubert import load_hubert
-    hubert = load_hubert(hubert_path, device, is_half)
-    _HUBERT_CACHE[key] = hubert
-    return hubert
+    key = (str(device), bool(is_half), *_file_identity(hubert_path))
+    with _COMPONENT_CACHE_LOCK:
+        cached = _HUBERT_CACHE.get(key)
+        if cached is not None:
+            _HUBERT_CACHE.move_to_end(key)
+            return cached
+        from hubert import load_hubert
+        hubert = load_hubert(hubert_path, device, is_half)
+        _HUBERT_CACHE[key] = hubert
+        _HUBERT_CACHE.move_to_end(key)
+        while len(_HUBERT_CACHE) > _BASE_MODEL_CACHE_MAX:
+            _HUBERT_CACHE.popitem(last=False)
+        return hubert
+
+
+def _load_faiss(device: torch.device, index_path: str):
+    resolved, mtime_ns, file_size = _file_identity(index_path)
+    key = (resolved, mtime_ns, file_size, str(device))
+    with _COMPONENT_CACHE_LOCK:
+        cached = _FAISS_CACHE.get(key)
+        if cached is not None:
+            _FAISS_CACHE.move_to_end(key)
+            return cached
+
+        import faiss
+        index = faiss.read_index(resolved)
+        big_npy = index.reconstruct_n(0, index.ntotal)
+        resources = None
+        if device.type == "cuda":
+            resources = faiss.StandardGpuResources()
+            gpu_id = 0 if device.index is None else int(device.index)
+            index = faiss.index_cpu_to_gpu(resources, gpu_id, index)
+            if isinstance(big_npy, np.ndarray):
+                big_npy = torch.from_numpy(big_npy).to(device)
+        _FAISS_CACHE[key] = (index, big_npy, resources)
+        _FAISS_CACHE.move_to_end(key)
+        while len(_FAISS_CACHE) > _INDEX_CACHE_MAX:
+            _FAISS_CACHE.popitem(last=False)
+        return index, big_npy, resources
  
  
 class RealtimeRVCInferer:
@@ -82,15 +144,19 @@ class RealtimeRVCInferer:
         self._index_rate: float = 0.0
         self._hubert_path: str = ""
         self._rmvpe_path: str = ""
+        self._hubert_identity: tuple[str, int, int] | None = None
+        self._rmvpe_identity: tuple[str, int, int] | None = None
+        self._index_identity: tuple[str, int, int] | None = None
 
         self._hubert: Optional[torch.nn.Module] = None
         self._net_g: Optional[torch.nn.Module] = None
         self._info: Optional[LoadedModelInfo] = None
-        self._net_g_cache: "OrderedDict[str, tuple[torch.nn.Module, LoadedModelInfo]]" = OrderedDict()
+        self._acquired_model_key: tuple | None = None
         self._last_unloaded_model_path: str = ""
  
         self._faiss_index = None
         self._faiss_big_npy = None
+        self._faiss_resource = None
  
         self.f0_up_key: int = 0
         self.formant_shift: float = 0.0
@@ -113,9 +179,37 @@ class RealtimeRVCInferer:
     def last_unloaded_model_path(self) -> str:
         return self._last_unloaded_model_path
 
+    def _model_key(self, model_path: str) -> tuple:
+        resolved, mtime_ns, file_size = _file_identity(model_path)
+        return (resolved, mtime_ns, file_size, str(self.device), bool(self.is_half))
+
     def get_loaded_model_paths(self) -> list[str]:
-        return list(self._net_g_cache.keys())
- 
+        with _SHARED_NET_G_LOCK:
+            return [
+                key[0] for key in _SHARED_NET_G_CACHE.keys()
+                if key[3] == str(self.device) and key[4] == bool(self.is_half)
+            ]
+
+    def reset_stream_state(self) -> None:
+        self._cache_pitch.zero_()
+        self._cache_pitchf.zero_()
+
+    def _release_active_model(self) -> None:
+        key = self._acquired_model_key
+        if key is not None:
+            with _SHARED_NET_G_LOCK:
+                entry = _SHARED_NET_G_CACHE.get(key)
+                if entry is not None:
+                    entry["users"] = max(0, int(entry.get("users", 0)) - 1)
+                    _SHARED_NET_G_CACHE.move_to_end(key)
+        self._acquired_model_key = None
+        self._net_g = None
+        self._info = None
+
+    def close(self) -> None:
+        self.reset_stream_state()
+        self._release_active_model()
+
     def configure(
         self,
         *,
@@ -126,7 +220,7 @@ class RealtimeRVCInferer:
         formant_shift: float = 0.0,
         hubert_path: str = "",
         rmvpe_path: str = "",
-    ) -> None:
+    ) -> bool:
         self.f0_up_key = int(f0_up_key or 0)
         self.formant_shift = float(formant_shift or 0.0)
 
@@ -140,30 +234,49 @@ class RealtimeRVCInferer:
         if index_rate > 1.0:
             index_rate = 1.0
 
-        if model_path != self._model_path:
-            self._model_path = model_path
-            self._cache_pitch.zero_()
-            self._cache_pitchf.zero_()
+        model_identity_changed = False
+        if model_path and self._acquired_model_key is not None:
+            try:
+                model_identity_changed = self._model_key(model_path) != self._acquired_model_key
+            except FileNotFoundError:
+                model_identity_changed = True
 
-        if hubert_path != self._hubert_path:
+        model_asset_changed = model_path != self._model_path or model_identity_changed
+        if model_asset_changed:
+            self._release_active_model()
+            self._model_path = model_path
+            self.reset_stream_state()
+
+        hubert_identity = _file_identity(hubert_path) if hubert_path else None
+        hubert_asset_changed = hubert_path != self._hubert_path or hubert_identity != self._hubert_identity
+        if hubert_asset_changed:
             self._hubert_path = hubert_path
+            self._hubert_identity = hubert_identity
             self._hubert = None  # Reload required
 
-        if rmvpe_path != self._rmvpe_path:
+        rmvpe_identity = _file_identity(rmvpe_path) if rmvpe_path else None
+        rmvpe_asset_changed = rmvpe_path != self._rmvpe_path or rmvpe_identity != self._rmvpe_identity
+        if rmvpe_asset_changed:
             self._rmvpe_path = rmvpe_path
+            self._rmvpe_identity = rmvpe_identity
             self._rmvpe = None  # Reload required
 
-        if index_path != self._index_path or index_rate != self._index_rate:
+        index_identity = _file_identity(index_path) if index_path else None
+        index_asset_changed = index_path != self._index_path or index_identity != self._index_identity
+        index_runtime_changed = index_asset_changed or index_rate != self._index_rate
+        if index_runtime_changed:
             self._index_path = index_path
+            self._index_identity = index_identity
             self._index_rate = index_rate
             self._faiss_index = None
             self._faiss_big_npy = None
+            self._faiss_resource = None
+
+        return bool(model_asset_changed or hubert_asset_changed or rmvpe_asset_changed or index_asset_changed)
  
     def warmup(self, f0method: str = "rmvpe") -> LoadedModelInfo:
-        self._ensure_models_loaded()
-        assert self._info is not None
-
-        # Perform a dummy inference to warm up the GPU/model
+        # Perform model loading and dummy inference under the same per-device
+        # lock used by live inference, preventing preload/inference VRAM races.
         try:
             # Create a small dummy input (~0.5s silence)
             dummy_wav_len = 8000
@@ -189,6 +302,7 @@ class RealtimeRVCInferer:
             # If warmup fails, propagate the error so the server can report it
             raise e
 
+        assert self._info is not None
         return self._info
  
     def _ensure_models_loaded(self) -> None:
@@ -200,61 +314,50 @@ class RealtimeRVCInferer:
 
         if self._index_rate > 0.0 and self._index_path:
             if self._faiss_index is None:
-                import faiss
                 if not os.path.exists(self._index_path):
                     raise FileNotFoundError(f"找不到 index：{self._index_path}")
-                index = faiss.read_index(self._index_path)
-                big_npy = index.reconstruct_n(0, index.ntotal)
-
-                if self.device.type == "cuda":
-                    try:
-                        res = faiss.StandardGpuResources()
-                        index = faiss.index_cpu_to_gpu(res, 0, index)
-                    except Exception as e:
-                        print(f"Failed to move faiss index to GPU: {e}")
-
-                self._faiss_index = index
-                self._faiss_big_npy = big_npy
-                if self.device.type == "cuda" and isinstance(self._faiss_big_npy, np.ndarray):
-                    self._faiss_big_npy = torch.from_numpy(self._faiss_big_npy).to(self.device)
+                self._faiss_index, self._faiss_big_npy, self._faiss_resource = _load_faiss(
+                    self.device, self._index_path
+                )
 
     def preload_model(self, model_path: str) -> dict:
+        with _device_infer_lock(self.device):
+            return self._preload_model_locked(model_path)
+
+    def _preload_model_locked(self, model_path: str) -> dict:
         model_path = str(model_path or "")
         if not model_path:
             raise RuntimeError("缺少 model_path")
-
         self._ensure_hubert_loaded()
+        key = self._model_key(model_path)
         evicted_paths: list[str] = []
+        with _SHARED_NET_G_LOCK:
+            if key in _SHARED_NET_G_CACHE:
+                _SHARED_NET_G_CACHE.move_to_end(key)
+                return {"loaded_paths": self.get_loaded_model_paths(), "evicted_paths": evicted_paths}
 
-        if model_path in self._net_g_cache:
-            self._activate_cached_model(model_path)
-            return {
-                "loaded_paths": self.get_loaded_model_paths(),
-                "evicted_paths": evicted_paths,
-            }
+            while True:
+                try:
+                    net_g, info = self._load_net_g_from_path(model_path)
+                    _SHARED_NET_G_CACHE[key] = {"net": net_g, "info": info, "users": 0}
+                    _SHARED_NET_G_CACHE.move_to_end(key)
+                    break
+                except RuntimeError as e:
+                    if self.device.type == "cuda" and "out of memory" in str(e).lower():
+                        evicted = self._evict_one_cached_model()
+                        if not evicted:
+                            raise
+                        evicted_paths.append(evicted)
+                        continue
+                    raise
 
-        while True:
-            try:
-                net_g, info = self._load_net_g_from_path(model_path)
-                self._net_g_cache[model_path] = (net_g, info)
-                self._net_g_cache.move_to_end(model_path)
-                break
-            except RuntimeError as e:
-                if self.device.type == "cuda" and "out of memory" in str(e).lower():
-                    evicted = self._evict_one_cached_model(keep_path=self._model_path)
-                    if not evicted:
-                        raise
-                    evicted_paths.append(evicted)
-                    continue
-                raise
+            while len(_SHARED_NET_G_CACHE) > _SHARED_NET_G_MAX:
+                evicted = self._evict_one_cached_model(keep_key=key)
+                if not evicted:
+                    break
+                evicted_paths.append(evicted)
 
-        if model_path == self._model_path:
-            self._activate_cached_model(model_path)
-
-        return {
-            "loaded_paths": self.get_loaded_model_paths(),
-            "evicted_paths": evicted_paths,
-        }
+        return {"loaded_paths": self.get_loaded_model_paths(), "evicted_paths": evicted_paths}
 
     def _ensure_hubert_loaded(self) -> None:
         if self._hubert is not None:
@@ -280,66 +383,65 @@ class RealtimeRVCInferer:
         self._hubert = _load_hubert(self.device, self.is_half, hubert_path)
 
     def _ensure_active_model_loaded(self) -> None:
-        if self._model_path in self._net_g_cache:
-            self._activate_cached_model(self._model_path)
+        if not self._model_path:
+            raise RuntimeError("缺少 model_path")
+        if self._acquired_model_key is not None and self._net_g is not None:
             return
+        desired_key = self._model_key(self._model_path)
+        self._release_active_model()
 
-        while True:
-            try:
-                net_g, info = self._load_net_g_from_path(self._model_path)
-                self._net_g_cache[self._model_path] = (net_g, info)
-                self._net_g_cache.move_to_end(self._model_path)
-                self._activate_cached_model(self._model_path)
-                return
-            except RuntimeError as e:
-                if self.device.type == "cuda" and "out of memory" in str(e).lower():
-                    evicted = self._evict_one_cached_model(keep_path=self._model_path)
-                    if not evicted:
+        with _SHARED_NET_G_LOCK:
+            entry = _SHARED_NET_G_CACHE.get(desired_key)
+            if entry is None:
+                while True:
+                    try:
+                        net_g, info = self._load_net_g_from_path(self._model_path)
+                        entry = {"net": net_g, "info": info, "users": 0}
+                        _SHARED_NET_G_CACHE[desired_key] = entry
+                        break
+                    except RuntimeError as e:
+                        if self.device.type == "cuda" and "out of memory" in str(e).lower():
+                            evicted = self._evict_one_cached_model(keep_key=desired_key)
+                            if not evicted:
+                                raise
+                            continue
                         raise
+            entry["users"] = int(entry.get("users", 0)) + 1
+            _SHARED_NET_G_CACHE.move_to_end(desired_key)
+            self._acquired_model_key = desired_key
+            self._net_g = entry["net"]
+            self._info = entry["info"]
+
+            while len(_SHARED_NET_G_CACHE) > _SHARED_NET_G_MAX:
+                if not self._evict_one_cached_model(keep_key=desired_key):
+                    break
+
+    def _evict_one_cached_model(self, keep_key: tuple | None = None) -> str:
+        with _SHARED_NET_G_LOCK:
+            victim_key = None
+            for key, entry in _SHARED_NET_G_CACHE.items():
+                if key == keep_key or int(entry.get("users", 0)) > 0:
                     continue
-                raise
-
-    def _activate_cached_model(self, model_path: str) -> None:
-        net_g, info = self._net_g_cache[model_path]
-        self._net_g = net_g
-        self._info = info
-        self._net_g_cache.move_to_end(model_path)
-
-    def _evict_one_cached_model(self, keep_path: str = "") -> str:
-        if not self._net_g_cache:
-            return ""
-
-        victim_path = ""
-        for path in self._net_g_cache.keys():
-            if keep_path and path == keep_path:
-                continue
-            victim_path = path
-            break
-
-        if not victim_path:
-            if keep_path in self._net_g_cache and len(self._net_g_cache) == 1:
+                victim_key = key
+                break
+            if victim_key is None:
                 return ""
-            victim_path = next(iter(self._net_g_cache.keys()))
 
-        victim_net, _ = self._net_g_cache.pop(victim_path)
-        try:
-            victim_net.to("cpu")
-        except Exception:
-            pass
-        del victim_net
-
-        if self._net_g is not None and victim_path == self._model_path:
-            self._net_g = None
-            self._info = None
-
-        if self.device.type == "cuda":
+            entry = _SHARED_NET_G_CACHE.pop(victim_key)
+            victim_net = entry.get("net")
             try:
-                torch.cuda.empty_cache()
+                if victim_net is not None:
+                    victim_net.to("cpu")
             except Exception:
                 pass
-
-        self._last_unloaded_model_path = victim_path
-        return victim_path
+            del victim_net
+            if self.device.type == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            self._last_unloaded_model_path = victim_key[0]
+            return victim_key[0]
 
     def _load_net_g_from_path(self, model_path: str) -> tuple[torch.nn.Module, LoadedModelInfo]:
         if not os.path.exists(model_path):
@@ -352,20 +454,9 @@ class RealtimeRVCInferer:
             SynthesizerTrnMs768NSFsid_nono,
         )
 
-        load_map_location = self.device if self.device.type == "cuda" else "cpu"
-        try:
-            try:
-                cpt = torch.load(model_path, map_location=load_map_location, weights_only=False)
-            except TypeError:
-                cpt = torch.load(model_path, map_location=load_map_location)
-        except RuntimeError as e:
-            if self.device.type == "cuda" and "out of memory" in str(e).lower():
-                try:
-                    cpt = torch.load(model_path, map_location="cpu", weights_only=False)
-                except TypeError:
-                    cpt = torch.load(model_path, map_location="cpu")
-            else:
-                raise
+        # RVC checkpoints contain plain tensors/config data; keep unpickling in
+        # weights-only mode and stage on CPU to avoid an avoidable GPU memory spike.
+        cpt = torch.load(model_path, map_location="cpu", weights_only=True)
 
         tgt_sr = cpt["config"][-1]
         cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
@@ -386,9 +477,10 @@ class RealtimeRVCInferer:
             raise RuntimeError(f"未知模型版本: {version}")
 
         del net_g.enc_q
+        net_g.load_state_dict(cpt["weight"], strict=False)
+        del cpt
         net_g = net_g.to(self.device)
         net_g = net_g.half() if self.is_half else net_g.float()
-        net_g.load_state_dict(cpt["weight"], strict=False)
         net_g.eval()
 
         info = LoadedModelInfo(tgt_sr=tgt_sr, if_f0=if_f0, version=version)
@@ -437,7 +529,7 @@ class RealtimeRVCInferer:
         model = _load_fcpe(self.device)
         x = x_16k.unsqueeze(0).float().to(self.device)
         f0 = model.infer(x, sr=16000, decoder_mode="local_argmax", threshold=0.006)
-        f0 = f0.squeeze().cpu().numpy().astype(np.float32)
+        f0 = f0.squeeze().float()
         f0 = f0 * pow(2.0, float(f0_up_key) / 12.0)
         return self._get_f0_post(f0)
 
@@ -464,57 +556,93 @@ class RealtimeRVCInferer:
         return_length: int,
         f0method: str,
     ) -> torch.Tensor:
+        with _device_infer_lock(self.device):
+            return self._infer_locked(
+                input_wav_16k,
+                block_frame_16k=block_frame_16k,
+                skip_head=skip_head,
+                return_length=return_length,
+                f0method=f0method,
+            )
+
+    @torch.inference_mode()
+    def _infer_locked(
+        self,
+        input_wav_16k: torch.Tensor,
+        *,
+        block_frame_16k: int,
+        skip_head: int,
+        return_length: int,
+        f0method: str,
+    ) -> torch.Tensor:
         self._ensure_models_loaded()
         assert self._hubert is not None
         assert self._net_g is not None
         assert self._info is not None
  
         input_wav_16k = input_wav_16k.to(self.device, dtype=torch.float16 if self.is_half else torch.float32)
-        with torch.no_grad():
-            feats_in = input_wav_16k.view(1, -1)
-            padding_mask = torch.zeros_like(feats_in, dtype=torch.bool, device=self.device)
-            output_layer = 9 if self._info.version == "v1" else 12
-            logits = self._hubert.extract_features(
-                source=feats_in,
-                padding_mask=padding_mask,
-                output_layer=output_layer,
-            )
-            feats = self._hubert.final_proj(logits[0]) if self._info.version == "v1" else logits[0]
-            feats = torch.cat((feats, feats[:, -1:, :]), 1)
+        feats_in = input_wav_16k.view(1, -1)
+        padding_mask = torch.zeros_like(feats_in, dtype=torch.bool, device=self.device)
+        output_layer = 9 if self._info.version == "v1" else 12
+        logits = self._hubert.extract_features(
+            source=feats_in,
+            padding_mask=padding_mask,
+            output_layer=output_layer,
+        )
+        feats = self._hubert.final_proj(logits[0]) if self._info.version == "v1" else logits[0]
+        feats = torch.cat((feats, feats[:, -1:, :]), 1)
  
         if self._faiss_index is not None and self._faiss_big_npy is not None and self._index_rate > 0.0:
             try:
-                npy = feats[0][skip_head // 2 :].detach().cpu().numpy().astype("float32")
-                score, ix = self._faiss_index.search(npy, k=8)
-                if (ix >= 0).all():
+                query = feats[0][skip_head // 2 :].float().contiguous()
+                score = ix = None
+                if self.device.type == "cuda":
+                    try:
+                        import faiss.contrib.torch_utils  # noqa: F401
+                        score, ix = self._faiss_index.search(query, k=8)
+                    except Exception:
+                        score = ix = None
+                if score is None or ix is None:
+                    score, ix = self._faiss_index.search(query.detach().cpu().numpy(), k=8)
+
+                if torch.is_tensor(ix):
+                    valid = bool(torch.all(ix >= 0).item())
+                else:
+                    valid = bool((ix >= 0).all())
+
+                if valid:
                     if torch.is_tensor(self._faiss_big_npy):
-                        score = torch.from_numpy(score).to(self.device)
-                        ix = torch.from_numpy(ix).to(self.device)
-                        
-                        weight = torch.square(1.0 / score)
-                        weight /= weight.sum(dim=1, keepdim=True)
-                        
+                        if not torch.is_tensor(score):
+                            score = torch.from_numpy(score).to(self.device)
+                        else:
+                            score = score.to(self.device)
+                        if not torch.is_tensor(ix):
+                            ix = torch.from_numpy(ix).to(self.device)
+                        else:
+                            ix = ix.to(self.device)
+                        score = score.clamp_min(1e-6)
+                        weight = torch.reciprocal(score).square()
+                        weight /= weight.sum(dim=1, keepdim=True).clamp_min(1e-12)
                         npy2 = self._faiss_big_npy[ix.long()]
                         if self.is_half:
                             npy2 = npy2.half()
-                        
-                        weight = weight.unsqueeze(2)
-                        npy2 = torch.sum(npy2 * weight, dim=1)
+                        npy2 = torch.sum(npy2 * weight.unsqueeze(2).to(npy2.dtype), dim=1)
                         feats_mix = npy2.unsqueeze(0)
                     else:
+                        score = np.maximum(np.asarray(score), 1e-6)
                         weight = np.square(1.0 / score)
-                        weight /= weight.sum(axis=1, keepdims=True)
+                        weight /= np.maximum(weight.sum(axis=1, keepdims=True), 1e-12)
                         npy2 = np.sum(self._faiss_big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
                         if self.is_half:
                             npy2 = npy2.astype("float16")
                         feats_mix = torch.from_numpy(npy2).unsqueeze(0).to(self.device)
 
-                    feats[0][skip_head // 2 :] = feats_mix * float(self._index_rate) + (1.0 - float(self._index_rate)) * feats[
-                        0
-                    ][skip_head // 2 :]
+                    feats[0][skip_head // 2 :] = (
+                        feats_mix * float(self._index_rate)
+                        + (1.0 - float(self._index_rate)) * feats[0][skip_head // 2 :]
+                    )
             except Exception as e:
                 print(f"Faiss error: {e}")
-                pass
  
         p_len_int = int(input_wav_16k.shape[0] // 160)
         factor = pow(2.0, float(self.formant_shift) / 12.0)

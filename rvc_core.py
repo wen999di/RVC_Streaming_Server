@@ -10,31 +10,34 @@ import math
  
  
 def _resample_1d(wav: torch.Tensor, orig_sr: int, new_sr: int) -> torch.Tensor:
-    if orig_sr == new_sr:
-        return wav
-    if wav.numel() == 0:
+    if orig_sr == new_sr or wav.numel() == 0:
         return wav
     orig_sr = int(orig_sr)
     new_sr = int(new_sr)
     if orig_sr <= 0 or new_sr <= 0:
         return wav
-    x = wav.detach()
-    x_np = x.float().cpu().numpy()
+    # Keep resampling on the same device. The previous scipy path forced a
+    # CUDA -> CPU -> CUDA round-trip for every inference block.
     try:
-        from scipy import signal
-        g = math.gcd(orig_sr, new_sr)
-        up = int(new_sr // g)
-        down = int(orig_sr // g)
-        y_np = signal.resample_poly(x_np, up, down).astype(np.float32, copy=False)
-        y = torch.from_numpy(y_np).to(wav.device)
-        return y
+        import torchaudio.functional as AF
+        return AF.resample(wav.float(), orig_sr, new_sr).to(dtype=wav.dtype)
     except Exception:
-        x2 = wav.view(1, 1, -1)
-        new_len = int(round(x2.shape[-1] * (float(new_sr) / float(orig_sr))))
+        x = wav.view(1, 1, -1)
+        new_len = int(round(x.shape[-1] * (float(new_sr) / float(orig_sr))))
         if new_len <= 0:
             return wav[:0]
-        y2 = F.interpolate(x2, size=new_len, mode="linear", align_corners=True)
-        return y2.view(-1)
+        return F.interpolate(x, size=new_len, mode="linear", align_corners=False).view(-1)
+
+
+def _clamp_float(value, default: float, minimum: float, maximum: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float(default)
+    if not math.isfinite(result):
+        result = float(default)
+    return min(float(maximum), max(float(minimum), result))
+
 
 class RVCCore:
     def __init__(self, config, device=None):
@@ -54,37 +57,29 @@ class RVCCore:
         self.update_config(config)
 
     def update_config(self, config):
-        self.config = config or {}
-        block_time = float(self.config.get("block_time", 0.25))
-        crossfade_time = float(self.config.get("crossfade_length", 0.05))
-        extra_time = float(self.config.get("extra_time", 2.0))
+        previous = dict(getattr(self, "config", {}) or {})
+        self.config = dict(config or {})
+        block_time = _clamp_float(self.config.get("block_time"), 0.16, 0.08, 1.0)
+        crossfade_time = _clamp_float(self.config.get("crossfade_length"), 0.04, 0.01, 0.04)
+        extra_time = _clamp_float(self.config.get("extra_time"), 1.0, 0.2, 4.0)
         self.passthrough = bool(self.config.get("passthrough", False))
-        self.f0_up_key = int(self.config.get("f0_up_key", 0))
-        self.formant_shift = float(self.config.get("formant_shift", 0))
-        self.f0_method = self.config.get("f0method", "rmvpe")
+        self.f0_up_key = max(-24, min(24, int(self.config.get("f0_up_key", 0) or 0)))
+        self.formant_shift = _clamp_float(self.config.get("formant_shift"), 0.0, -4.0, 4.0)
+        self.f0_method = str(self.config.get("f0method", "rmvpe") or "rmvpe")
         self.model_path = str(self.config.get("model_path", "") or "")
         self.index_path = str(self.config.get("index_path", "") or "")
         self.hubert_path = str(self.config.get("hubert_path", "") or "")
         self.rmvpe_path = str(self.config.get("rmvpe_path", "") or "")
-        self.index_rate = float(self.config.get("index_rate", 0.0) or 0.0)
-        self.silence_db_threshold = float(self.config.get("silence_db_threshold", -70.0) or -70.0)
-        self.silence_gate_atten = float(self.config.get("silence_gate_atten", 0.0) or 0.0)
-        if self.silence_gate_atten < 0.0:
-            self.silence_gate_atten = 0.0
-        if self.silence_gate_atten > 1.0:
-            self.silence_gate_atten = 1.0
+        self.index_rate = _clamp_float(self.config.get("index_rate"), 0.0, 0.0, 1.0)
+        self.silence_db_threshold = _clamp_float(self.config.get("silence_db_threshold"), -70.0, -120.0, 0.0)
+        self.silence_gate_atten = _clamp_float(self.config.get("silence_gate_atten"), 0.0, 0.0, 1.0)
         self.input_noise_reduce = bool(self.config.get("input_noise_reduce", False))
         self.output_noise_reduce = bool(self.config.get("output_noise_reduce", False))
-        self.noise_reduce_prop_decrease = float(self.config.get("noise_reduce_prop_decrease", 0.9) or 0.9)
-        if self.noise_reduce_prop_decrease < 0.0:
-            self.noise_reduce_prop_decrease = 0.0
-        if self.noise_reduce_prop_decrease > 1.0:
-            self.noise_reduce_prop_decrease = 1.0
-        self.rms_mix_rate = float(self.config.get("rms_mix_rate", 0.8) or 0.8)
-        if self.rms_mix_rate < 0.0:
-            self.rms_mix_rate = 0.0
-        if self.rms_mix_rate > 1.0:
-            self.rms_mix_rate = 1.0
+        self.noise_reduce_prop_decrease = _clamp_float(
+            self.config.get("noise_reduce_prop_decrease"), 0.9, 0.0, 1.0
+        )
+        self.rms_mix_rate = _clamp_float(self.config.get("rms_mix_rate"), 0.8, 0.0, 1.0)
+
         if (self.input_noise_reduce or self.output_noise_reduce) and self.model_path and not self.passthrough:
             if self._torchgate is None or int(getattr(self._torchgate, "sr", 0)) != int(self.sr):
                 self._torchgate = TorchGate(
@@ -101,7 +96,8 @@ class RVCCore:
                 self._torchgate.prop_decrease = float(self.noise_reduce_prop_decrease)
         else:
             self._torchgate = None
-        self._inferer.configure(
+
+        inferer_assets_changed = self._inferer.configure(
             model_path=self.model_path,
             index_path=self.index_path,
             index_rate=self.index_rate,
@@ -110,10 +106,48 @@ class RVCCore:
             hubert_path=self.hubert_path,
             rmvpe_path=self.rmvpe_path,
         )
-        self._update_buffer_params(block_time, crossfade_time, extra_time)
+
+        buffer_signature = (round(block_time, 6), round(crossfade_time, 6), round(extra_time, 6))
+        buffer_changed = getattr(self, "_buffer_signature", None) != buffer_signature
+        model_keys = ("model_path", "index_path", "hubert_path", "rmvpe_path", "f0method", "passthrough")
+        previous_index_rate = _clamp_float(previous.get("index_rate"), 0.0, 0.0, 1.0)
+        index_usage_changed = (previous_index_rate > 0.0) != (self.index_rate > 0.0)
+        model_runtime_changed = (
+            any(previous.get(k) != self.config.get(k) for k in model_keys)
+            or index_usage_changed
+            or bool(inferer_assets_changed)
+        )
+
+        if buffer_changed:
+            self._update_buffer_params(block_time, crossfade_time, extra_time)
+            self._buffer_signature = buffer_signature
+            self.pending_samples = 0
+            self._in_segments = deque()
+        elif model_runtime_changed:
+            self.reset_stream_state()
+
+        return {
+            "buffer_layout": bool(buffer_changed),
+            "model_runtime": bool(model_runtime_changed),
+        }
+
+    def reset_stream_state(self):
         self.pending_samples = 0
         self._in_segments = deque()
- 
+        for name in (
+            "input_wav", "input_wav_denoise", "sola_buffer", "nr_buffer",
+            "output_buffer", "out_nr_buffer",
+        ):
+            value = getattr(self, name, None)
+            if torch.is_tensor(value):
+                value.zero_()
+        if hasattr(self, "input_wav"):
+            self.ts_window = deque([(int(self.input_wav.shape[0]), None)])
+        self._inferer.reset_stream_state()
+
+    def close(self):
+        self._inferer.close()
+
     def warmup(self):
         return self._inferer.warmup(f0method=self.f0_method)
 
@@ -405,7 +439,7 @@ class RVCCore:
                 rms1 = self._rms_env(ref, frame_length=int(4 * self.zc), hop_length=int(self.zc), out_len=out_len)
                 rms2 = self._rms_env(infer_wav, frame_length=int(4 * self.zc), hop_length=int(self.zc), out_len=out_len)
                 rms2 = torch.maximum(rms2, torch.zeros_like(rms2) + 1e-3)
-                exp = torch.tensor(1.0 - float(self.rms_mix_rate), device=infer_wav.device, dtype=infer_wav.dtype)
+                exp = 1.0 - float(self.rms_mix_rate)
                 infer_wav = infer_wav * torch.pow(rms1 / rms2, exp)
             except Exception:
                 now_s = time.time()
@@ -415,6 +449,11 @@ class RVCCore:
 
         out_wav, sola_offset = self._sola_logic_with_offset(infer_wav)
         read_idx = self.extra_frame + sola_offset
+        # Input denoising uses a causal OLA window. Its emitted block is delayed by
+        # one SOLA overlap relative to raw input; reflect that in media timestamps
+        # so latency/jitter telemetry remains physically meaningful.
+        if self.input_noise_reduce and self._torchgate is not None:
+            read_idx = max(0, read_idx - int(self.sola_buffer_frame))
         out_ts = self._get_ts_at(read_idx)
         return out_wav, out_ts
 
