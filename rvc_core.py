@@ -148,6 +148,9 @@ class RVCCore:
     def close(self):
         self._inferer.close()
 
+    def prepare(self):
+        return self._inferer.prepare(f0method=self.f0_method)
+
     def warmup(self):
         return self._inferer.warmup(f0method=self.f0_method)
 

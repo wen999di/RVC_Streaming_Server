@@ -267,6 +267,10 @@ class AudioProcessor:
         with self._lock:
             self.core.close()
 
+    def prepare(self):
+        with self._lock:
+            return self.core.prepare()
+
     def warmup(self):
         with self._lock:
             return self.core.warmup()
@@ -279,10 +283,12 @@ class AudioProcessor:
         with self._lock:
             block_bytes = max(4, int(self.core.block_frame) * int(self.core.bytes_per_sample))
             ns_per_sample = int(self.core.ns_per_sample)
+            base_ts_ns = int(ts_start_ns or 0)
             results = []
             for offset in range(0, len(audio_data), block_bytes):
                 chunk = audio_data[offset : offset + block_bytes]
-                chunk_ts = int(ts_start_ns or 0) + (offset // int(self.core.bytes_per_sample)) * ns_per_sample
+                offset_samples = offset // int(self.core.bytes_per_sample)
+                chunk_ts = base_ts_ns + offset_samples * ns_per_sample if base_ts_ns > 0 else 0
                 t0 = time.perf_counter()
                 out_pcm, out_ts_ns = self.core.process_frame(chunk, chunk_ts)
                 proc_ms = int(round((time.perf_counter() - t0) * 1000.0))
@@ -347,9 +353,9 @@ class RealtimeAudioSession:
                 self._drain_input()
                 self._drain(self.output_queue)
                 await asyncio.to_thread(self.processor.reset_stream_state)
-            should_warmup = bool(changes.get("model_runtime"))
-            if should_warmup and not self.processor.core.passthrough and self.processor.core.model_path:
-                await asyncio.to_thread(self.processor.warmup)
+            should_prepare = bool(changes.get("model_runtime"))
+            if should_prepare and not self.processor.core.passthrough and self.processor.core.model_path:
+                await asyncio.to_thread(self.processor.prepare)
             return changes
 
     async def enqueue(self, frame: AudioInputFrame) -> None:
@@ -577,6 +583,7 @@ async def binary_echo_handler(websocket):
                     elif "config" in data:
                         cfg = data["config"] if isinstance(data.get("config"), dict) else {}
                         seq = data.get("seq", None)
+                        logging.info("Config request: seq=%s keys=%s", seq, sorted(cfg.keys()))
                         passthrough = bool(cfg.get("passthrough", False))
 
                         # 校验音色模型文件存在（路径解析统一由 _resolve_runtime_config 处理）
@@ -619,9 +626,17 @@ async def binary_echo_handler(websocket):
                         try:
                             if audio_session is None:
                                 raise RuntimeError("audio_endpoint_required")
+                            apply_started = time.perf_counter()
                             changes = await audio_session.apply_config(cfg)
+                            logging.info(
+                                "Config applied: seq=%s model_runtime=%s buffer_layout=%s elapsed=%.1fms",
+                                seq,
+                                bool(changes.get("model_runtime")),
+                                bool(changes.get("buffer_layout")),
+                                (time.perf_counter() - apply_started) * 1000.0,
+                            )
                         except Exception as e:
-                            logging.error(f"Config Error: warmup failed: {e}", exc_info=True)
+                            logging.error(f"Config Error: model prepare failed: {e}", exc_info=True)
                             await _ws_send(websocket,
                                 json.dumps(
                                     {

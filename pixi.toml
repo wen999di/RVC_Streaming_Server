@@ -1,8 +1,8 @@
 [workspace]
 name = "RVC"
 version = "0.1.0"
-channels = ["conda-forge", "pytorch", "nvidia"]
-platforms = ["linux-64"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "win-64"]
 channel-priority = "disabled"
 
 [workspace.pypi-options]
@@ -14,13 +14,19 @@ numpy = ">=1.22,<2"
 scipy = ">=1.10,<2"
 librosa = ">=0.10,<1"
 websockets = ">=12,<13"
-pytorch = "2.5.1.*"
 pip = ">=23,<25"
-torchaudio = "2.5.1.*"
+setuptools = ">=70,<82"
 
 [pypi-dependencies]
-faiss-gpu = ">=1.7,<2"
+torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" }
 torchfcpe = ">=0.0.4,<1"
+
+[target.linux-64.pypi-dependencies]
+faiss-gpu = ">=1.7,<2"
+
+[target.win-64.dependencies]
+faiss-gpu = "1.9.*"
 
 [tasks]
 start = "python server.py"

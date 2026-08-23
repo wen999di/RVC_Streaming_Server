@@ -1,4 +1,6 @@
 import os
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from collections import OrderedDict
@@ -263,18 +265,56 @@ class RealtimeRVCInferer:
 
         index_identity = _file_identity(index_path) if index_path else None
         index_asset_changed = index_path != self._index_path or index_identity != self._index_identity
-        index_runtime_changed = index_asset_changed or index_rate != self._index_rate
-        if index_runtime_changed:
+        if index_asset_changed:
             self._index_path = index_path
             self._index_identity = index_identity
-            self._index_rate = index_rate
             self._faiss_index = None
             self._faiss_big_npy = None
             self._faiss_resource = None
+        self._index_rate = index_rate
 
         return bool(model_asset_changed or hubert_asset_changed or rmvpe_asset_changed or index_asset_changed)
- 
+
+    def prepare(self, f0method: str = "rmvpe") -> LoadedModelInfo:
+        with _device_infer_lock(self.device):
+            return self._prepare_locked(f0method)
+
+    def _prepare_locked(self, f0method: str) -> LoadedModelInfo:
+        if not self._model_path:
+            raise RuntimeError("缺少 model_path")
+
+        started = time.perf_counter()
+
+        stage_started = time.perf_counter()
+        self._ensure_hubert_loaded()
+        hubert_ms = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
+        self._ensure_active_model_loaded()
+        voice_ms = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
+        self._ensure_index_loaded()
+        index_ms = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
+        self._ensure_f0_model_loaded(f0method)
+        f0_ms = (time.perf_counter() - stage_started) * 1000.0
+
+        assert self._info is not None
+        logging.info(
+            "Model prepare stages: hubert=%.1fms voice=%.1fms index=%.1fms f0=%.1fms total=%.1fms device=%s",
+            hubert_ms,
+            voice_ms,
+            index_ms,
+            f0_ms,
+            (time.perf_counter() - started) * 1000.0,
+            self.device,
+        )
+        return self._info
+
     def warmup(self, f0method: str = "rmvpe") -> LoadedModelInfo:
+        self.prepare(f0method)
         # Perform model loading and dummy inference under the same per-device
         # lock used by live inference, preventing preload/inference VRAM races.
         try:
@@ -311,7 +351,9 @@ class RealtimeRVCInferer:
 
         self._ensure_hubert_loaded()
         self._ensure_active_model_loaded()
+        self._ensure_index_loaded()
 
+    def _ensure_index_loaded(self) -> None:
         if self._index_rate > 0.0 and self._index_path:
             if self._faiss_index is None:
                 if not os.path.exists(self._index_path):
@@ -319,6 +361,19 @@ class RealtimeRVCInferer:
                 self._faiss_index, self._faiss_big_npy, self._faiss_resource = _load_faiss(
                     self.device, self._index_path
                 )
+
+    def _ensure_f0_model_loaded(self, f0method: str) -> None:
+        if self._info is not None and int(self._info.if_f0) != 1:
+            return
+
+        method = str(f0method or "rmvpe").lower()
+        if method == "rmvpe":
+            self._ensure_rmvpe_loaded()
+            return
+        if method == "fcpe":
+            _load_fcpe(self.device)
+            return
+        raise RuntimeError(f"不支持的 f0method: {method}")
 
     def preload_model(self, model_path: str) -> dict:
         with _device_infer_lock(self.device):
@@ -501,30 +556,36 @@ class RealtimeRVCInferer:
         return f0_coarse, f0
  
     def _get_f0_rmvpe(self, x_16k: torch.Tensor, f0_up_key: float) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._rmvpe is None:
-            rmvpe_path = self._rmvpe_path
-            if not rmvpe_path:
-                files_dir = Path(__file__).parent / "files"
-                alt_rmvpe = files_dir / "rmvpe.pt"
-                if alt_rmvpe.exists():
-                    rmvpe_path = str(alt_rmvpe)
-
-            if not os.path.exists(rmvpe_path):
-                # Try finding in files if only filename given
-                if self._rmvpe_path and not os.path.isabs(self._rmvpe_path):
-                    files_dir = Path(__file__).parent / "files"
-                    alt = files_dir / self._rmvpe_path
-                    if alt.exists():
-                        rmvpe_path = str(alt)
-
-            if not os.path.exists(rmvpe_path):
-                raise FileNotFoundError(f"找不到 RMVPE 权重: {rmvpe_path}")
-
-            self._rmvpe = _load_rmvpe(self.device, self.is_half, rmvpe_path)
+        self._ensure_rmvpe_loaded()
+        assert self._rmvpe is not None
         f0 = self._rmvpe.infer_from_audio(x_16k, thred=0.03)
         f0 = f0 * pow(2.0, float(f0_up_key) / 12.0)
         return self._get_f0_post(f0)
- 
+
+    def _ensure_rmvpe_loaded(self) -> None:
+        if self._rmvpe is not None:
+            return
+
+        rmvpe_path = self._rmvpe_path
+        if not rmvpe_path:
+            files_dir = Path(__file__).parent / "files"
+            alt_rmvpe = files_dir / "rmvpe.pt"
+            if alt_rmvpe.exists():
+                rmvpe_path = str(alt_rmvpe)
+
+        if not os.path.exists(rmvpe_path):
+            # Try finding in files if only filename given
+            if self._rmvpe_path and not os.path.isabs(self._rmvpe_path):
+                files_dir = Path(__file__).parent / "files"
+                alt = files_dir / self._rmvpe_path
+                if alt.exists():
+                    rmvpe_path = str(alt)
+
+        if not os.path.exists(rmvpe_path):
+            raise FileNotFoundError(f"找不到 RMVPE 权重: {rmvpe_path}")
+
+        self._rmvpe = _load_rmvpe(self.device, self.is_half, rmvpe_path)
+
     def _get_f0_fcpe(self, x_16k: torch.Tensor, f0_up_key: float) -> tuple[torch.Tensor, torch.Tensor]:
         model = _load_fcpe(self.device)
         x = x_16k.unsqueeze(0).float().to(self.device)

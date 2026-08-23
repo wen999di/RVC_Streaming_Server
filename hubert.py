@@ -445,10 +445,30 @@ class _SafePickleModule:
         return getattr(_real_pickle, name)
 
 
+_FairseqDictionary = type(
+    "Dictionary",
+    (),
+    {
+        "__module__": "fairseq.data.dictionary",
+        "__init__": lambda self, *args, **kwargs: None,
+        "__setstate__": lambda self, state: self.__dict__.update(state)
+        if isinstance(state, dict) else None,
+    },
+)
+
+
 def load_hubert(checkpoint_path: str, device: torch.device,
                 is_half: bool) -> HubertModel:
     try:
-        cpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        # Official fairseq HuBERT checkpoints pickle Dictionary metadata even
+        # though inference only needs their tensor state. Map that one known
+        # type to an inert compatibility object and keep weights-only loading.
+        with torch.serialization.safe_globals([_FairseqDictionary]):
+            cpt = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=True,
+            )
     except Exception as safe_error:
         # Legacy fairseq HuBERT checkpoints may contain pickled config objects.
         # Unsafe pickle is disabled by default; administrators may explicitly
