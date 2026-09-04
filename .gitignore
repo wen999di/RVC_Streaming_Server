@@ -8,3 +8,7 @@ files/*
 uploads/*
 logs/*
 .pixi/
+.hub-cache/
+training_jobs/
+training_jobs.json
+data/

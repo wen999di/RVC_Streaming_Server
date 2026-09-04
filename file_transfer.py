@@ -5,7 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 import struct
 import threading
 import functools
@@ -21,24 +21,58 @@ def _synchronized(method):
 
 FILE_MAGIC = b"RVCFILE1"
 FILE_CHUNK_TYPE = 1
+TRAINING_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"}
 
 
 def _now_s() -> float:
     return time.time()
 
 
-def sanitize_filename(name: str) -> str:
+def sanitize_relative_path(name: str) -> str:
     if not isinstance(name, str):
         raise ValueError("invalid filename")
-    name = name.strip()
-    name = os.path.basename(name)
-    if not name or name in (".", ".."):
+    raw = name.strip().replace("\\", "/")
+    if not raw or raw.startswith("/") or len(raw) > 2048 or "\x00" in raw:
         raise ValueError("invalid filename")
-    if any(sep in name for sep in ("/", "\\", "\x00")):
+    parts = raw.split("/")
+    forbidden = set('<>:"|?*')
+    if any(
+        not part
+        or part in (".", "..")
+        or len(part) > 255
+        or part[-1] in (" ", ".")
+        or any(ord(ch) < 32 or ch in forbidden for ch in part)
+        for part in parts
+    ):
         raise ValueError("invalid filename")
-    if len(name) > 255:
-        raise ValueError("filename too long")
-    return name
+    return "/".join(parts)
+
+
+def resolve_relative_file(root: Path, name: str) -> tuple[str, Path]:
+    safe_name = sanitize_relative_path(name)
+    root = root.resolve()
+    target = (root / Path(*safe_name.split("/"))).resolve()
+    if root not in target.parents:
+        raise ValueError("invalid filename")
+    return safe_name, target
+
+
+def _sanitize_dataset_segment(value: object, fallback: str, max_length: int = 80) -> str:
+    raw = str(value or "").strip()
+    forbidden = set('<>:"/\\|?*')
+    cleaned = "".join(
+        "_" if ord(ch) < 32 or ch in forbidden else ch
+        for ch in raw
+    ).strip(" .")
+    cleaned = cleaned[:max_length].rstrip(" .") or fallback
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+    if cleaned.upper() in reserved:
+        cleaned = f"_{cleaned}"
+    return cleaned
 
 
 def sha256_file(path: Path) -> str:
@@ -108,7 +142,7 @@ class UploadMeta:
 
 class UploadManager:
     def __init__(self, base_dir: Optional[Path] = None) -> None:
-        self.base_dir = base_dir or Path(__file__).resolve().parent
+        self.base_dir = (base_dir or Path(__file__).resolve().parent).resolve()
         self.files_dir = self.base_dir / "files"
         self.partial_dir = self.files_dir / ".partial"
         self.uploads_dir = self.base_dir / "uploads"
@@ -162,8 +196,8 @@ class UploadManager:
 
     @_synchronized
     def init_upload(self, *, name: str, size: int, sha256: str) -> UploadMeta:
-        safe_name = sanitize_filename(name)
-        if size <= 0:
+        safe_name = sanitize_relative_path(name)
+        if size < 0:
             raise ValueError("invalid size")
         if size > self.max_upload_bytes:
             raise ValueError("file_too_large")
@@ -171,7 +205,7 @@ class UploadManager:
         if sha256 and (len(sha256) != 64 or any(ch not in "0123456789abcdef" for ch in sha256)):
             raise ValueError("invalid sha256")
 
-        key = sha256 or f"name:{safe_name}|size:{size}"
+        key = f"name:{safe_name.lower()}|size:{size}|sha256:{sha256}"
         existing_id = self._key_to_upload_id.get(key)
         if existing_id:
             existing = self._uploads.get(existing_id)
@@ -259,17 +293,10 @@ class UploadManager:
             if actual.lower() != meta.sha256.lower():
                 raise ValueError("sha256_mismatch")
 
-        target = self.files_dir / meta.name
-        if target.exists():
-            stem = target.stem
-            suffix = target.suffix
-            disambiguator = time.strftime("%Y%m%d_%H%M%S")
-            counter = 1
-            candidate = self.files_dir / f"{stem}_{disambiguator}{suffix}"
-            while candidate.exists():
-                counter += 1
-                candidate = self.files_dir / f"{stem}_{disambiguator}_{counter}{suffix}"
-            target = candidate
+        _, target = resolve_relative_file(self.files_dir, meta.name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and not target.is_file():
+            raise ValueError("target_not_a_file")
 
         os.replace(part, target)
 
@@ -278,7 +305,7 @@ class UploadManager:
         if meta.key and self._key_to_upload_id.get(meta.key) == upload_id:
             self._key_to_upload_id.pop(meta.key, None)
         self._last_meta_flush_s.pop(upload_id, None)
-        return meta, target.name
+        return meta, target.relative_to(self.files_dir).as_posix()
 
     @_synchronized
     def abort_sync(self, *, upload_id: str) -> None:
@@ -292,13 +319,15 @@ class UploadManager:
     @_synchronized
     def list_files(self) -> list[dict]:
         items: list[dict] = []
-        for p in self.files_dir.iterdir():
+        for p in self.files_dir.rglob("*"):
             if not p.is_file():
+                continue
+            if self.partial_dir == p.parent or self.partial_dir in p.parents:
                 continue
             st = p.stat()
             items.append(
                 {
-                    "name": p.name,
+                    "name": p.relative_to(self.files_dir).as_posix(),
                     "size": int(st.st_size),
                     "mtime": float(st.st_mtime),
                 }
@@ -308,33 +337,114 @@ class UploadManager:
 
     @_synchronized
     def delete_file(self, *, name: str) -> None:
-        safe_name = sanitize_filename(name)
-        target = self.files_dir / safe_name
+        _, target = resolve_relative_file(self.files_dir, name)
         if not target.exists():
             raise FileNotFoundError("file_not_found")
         if not target.is_file():
             raise ValueError("not_a_file")
         target.unlink()
+        parent = target.parent
+        while parent != self.files_dir and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
 
     @_synchronized
     def rename_file(self, *, old_name: str, new_name: str) -> str:
-        old_safe = sanitize_filename(old_name)
-        new_safe = sanitize_filename(new_name)
+        old_safe, src = resolve_relative_file(self.files_dir, old_name)
+        new_safe, dst = resolve_relative_file(self.files_dir, new_name)
         if old_safe.lower() == new_safe.lower():
             return new_safe
-
-        src = self.files_dir / old_safe
         if not src.exists():
             raise FileNotFoundError("file_not_found")
         if not src.is_file():
             raise ValueError("not_a_file")
 
-        dst = self.files_dir / new_safe
         if dst.exists():
             raise FileExistsError("target_exists")
 
+        dst.parent.mkdir(parents=True, exist_ok=True)
         os.replace(src, dst)
-        return dst.name
+        parent = src.parent
+        while parent != self.files_dir and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+        return dst.relative_to(self.files_dir).as_posix()
+
+    @_synchronized
+    def organize_training_files(self, *, model_name: object, files: object) -> dict:
+        if not isinstance(files, list) or not files:
+            raise ValueError("没有可整理的训练音频")
+        if len(files) > 20000:
+            raise ValueError("训练音频文件数量不能超过 20000")
+
+        model_segment = _sanitize_dataset_segment(model_name, "my model")
+        entries: list[tuple[str, Path, str, str]] = []
+        seen_sources: set[str] = set()
+        for raw in files:
+            item = raw if isinstance(raw, Mapping) else {"name": raw}
+            old_safe, source = resolve_relative_file(self.files_dir, str(item.get("name") or ""))
+            if old_safe.lower() in seen_sources:
+                raise ValueError(f"训练音频重复: {old_safe}")
+            if not source.is_file():
+                raise FileNotFoundError(old_safe)
+            suffix = source.suffix.lower()
+            if suffix not in TRAINING_AUDIO_SUFFIXES:
+                raise ValueError(f"不支持的训练音频类型: {old_safe}")
+            speaker = _sanitize_dataset_segment(item.get("speaker"), "默认说话人")
+            stem = _sanitize_dataset_segment(source.stem, "audio", max_length=180)
+            entries.append((old_safe, source, speaker, f"{stem}{suffix}"))
+            seen_sources.add(old_safe.lower())
+
+        plan: list[tuple[str, Path, str, Path]] = []
+        planned_targets: set[Path] = set()
+        for old_safe, source, speaker, filename in entries:
+            base_stem = Path(filename).stem
+            suffix = Path(filename).suffix
+            attempt = 1
+            while True:
+                candidate_name = filename if attempt == 1 else f"{base_stem}_{attempt}{suffix}"
+                new_safe, target = resolve_relative_file(
+                    self.files_dir,
+                    f"{model_segment}/dataset/{speaker}/{candidate_name}",
+                )
+                occupied = target in planned_targets or (target.exists() and target != source)
+                if not occupied:
+                    break
+                attempt += 1
+            planned_targets.add(target)
+            plan.append((old_safe, source, new_safe, target))
+
+        moved: list[tuple[Path, Path]] = []
+        try:
+            for _, source, _, target in plan:
+                if source == target:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+                moved.append((source, target))
+        except Exception:
+            for source, target in reversed(moved):
+                try:
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(target, source)
+                except Exception:
+                    pass
+            raise
+
+        for _, source, _, _ in plan:
+            parent = source.parent
+            while parent != self.files_dir and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
+
+        return {
+            "model": model_segment,
+            "dataset_root": f"{model_segment}/dataset",
+            "files": [
+                {"old_name": old_safe, "new_name": new_safe}
+                for old_safe, _, new_safe, _ in plan
+            ],
+        }
 
     def _flush_meta(self, meta: UploadMeta, *, force: bool) -> None:
         now = _now_s()

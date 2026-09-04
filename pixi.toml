@@ -21,6 +21,8 @@ setuptools = ">=70,<82"
 torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" }
 torchaudio = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" }
 torchfcpe = ">=0.0.4,<1"
+huggingface-hub = ">=0.34,<2"
+modelscope-hub = ">=0.1.8,<1"
 
 [target.linux-64.pypi-dependencies]
 faiss-gpu = ">=1.7,<2"
@@ -28,5 +30,25 @@ faiss-gpu = ">=1.7,<2"
 [target.win-64.dependencies]
 faiss-gpu = "1.9.*"
 
+# PyMSS currently requires the Torch 2.7 generation, while realtime RVC
+# uses Torch 2.11. Keep source separation isolated so installing it cannot
+# downgrade or destabilize the low-latency runtime.
+[feature.pymss.dependencies]
+python = "3.12.*"
+numpy = ">=1.26.4,<2"
+pip = ">=24,<26"
+setuptools = ">=75,<81"
+ffmpeg = ">=7,<8"
+
+[feature.pymss.pypi-dependencies]
+torch = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" }
+pymss = "==2.0.14"
+pymss-core = "==0.1.4"
+
+[environments]
+pymss = { features = ["pymss"], no-default-feature = true }
+
 [tasks]
 start = "python server.py"
+start-local = "python server.py --stdio"

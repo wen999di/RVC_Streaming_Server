@@ -6,6 +6,8 @@ import uuid
 import threading
 import functools
 
+from file_transfer import resolve_relative_file, sanitize_relative_path
+
 
 def _synchronized(method):
     @functools.wraps(method)
@@ -13,17 +15,6 @@ def _synchronized(method):
         with self._lock:
             return method(self, *args, **kwargs)
     return wrapper
-
-
-def _safe_basename(name: str) -> str:
-    if not isinstance(name, str):
-        raise ValueError("invalid filename")
-    name = os.path.basename(name.strip())
-    if not name or name in (".", ".."):
-        raise ValueError("invalid filename")
-    if any(sep in name for sep in ("/", "\\", "\x00")):
-        raise ValueError("invalid filename")
-    return name
 
 
 @dataclass(frozen=True)
@@ -36,7 +27,26 @@ class ModelSlot:
 SLOTS: tuple[ModelSlot, ...] = (
     ModelSlot(slot="hubert_base", title="Hubert 基模", allowed_ext=(".pt",)),
     ModelSlot(slot="rmvpe", title="RMVPE 声高模型", allowed_ext=(".pt",)),
-    ModelSlot(slot="uvr5_weight", title="UVR5 模型", allowed_ext=(".pth", ".onnx")),
+    ModelSlot(
+        slot="pymss_weight",
+        title="PyMSS",
+        allowed_ext=(".ckpt", ".pth", ".th"),
+    ),
+    ModelSlot(
+        slot="pymss_config",
+        title="PyMSS 配置",
+        allowed_ext=(".yaml", ".yml"),
+    ),
+    ModelSlot(
+        slot="pretrained_g",
+        title="RVC 预训练生成器 (G)",
+        allowed_ext=(".pth", ".pt"),
+    ),
+    ModelSlot(
+        slot="pretrained_d",
+        title="RVC 预训练判别器 (D)",
+        allowed_ext=(".pth", ".pt"),
+    ),
 )
 
 
@@ -135,12 +145,11 @@ class ModelRegistry:
         slot_def = next((s for s in SLOTS if s.slot == slot), None)
         if not slot_def:
             raise ValueError("unknown_slot")
-        filename = _safe_basename(filename)
+        filename, target = resolve_relative_file(files_dir, filename)
         if slot_def.allowed_ext and not filename.lower().endswith(
             tuple(ext.lower() for ext in slot_def.allowed_ext)
         ):
             raise ValueError("invalid_extension")
-        target = files_dir / filename
         if not target.exists() or not target.is_file():
             raise FileNotFoundError("file_not_found")
 
@@ -156,7 +165,7 @@ class ModelRegistry:
     @_synchronized
     def activate_in_slot(self, *, slot: str, filename: str) -> dict:
         slot = str(slot).strip()
-        filename = _safe_basename(filename)
+        filename = sanitize_relative_path(filename)
         slot_state = self.list_slots().get(slot)
         if not slot_state:
             raise ValueError("unknown_slot")
@@ -169,7 +178,7 @@ class ModelRegistry:
     @_synchronized
     def remove_from_slot(self, *, slot: str, filename: str) -> dict:
         slot = str(slot).strip()
-        filename = _safe_basename(filename)
+        filename = sanitize_relative_path(filename)
         slot_state = self.list_slots().get(slot)
         if not slot_state:
             raise ValueError("unknown_slot")
@@ -197,31 +206,42 @@ class ModelRegistry:
             name = str(m.get("name") or "")
             pth = str(m.get("pth") or "")
             index = str(m.get("index") or "")
+            try:
+                speaker_id = max(0, int(m.get("speaker_id", 0)))
+            except (TypeError, ValueError):
+                speaker_id = 0
             if not model_id or not name or not pth:
                 continue
             out_models.append(
-                {"id": model_id, "name": name, "pth": pth, "index": index, "active": model_id == active_id}
+                {"id": model_id, "name": name, "pth": pth, "index": index, "speaker_id": speaker_id, "active": model_id == active_id}
             )
         return {"active_id": active_id, "models": out_models}
 
     @_synchronized
-    def add_voice_model(self, *, name: str, pth: str, index: str, files_dir: Path) -> dict:
+    def add_voice_model(self, *, name: str, pth: str, index: str, files_dir: Path, speaker_id: int = 0) -> dict:
         name = str(name or "").strip()
         if not name:
             raise ValueError("invalid_name")
-        pth = _safe_basename(pth)
-        index = _safe_basename(index) if index else ""
+        pth, pth_path = resolve_relative_file(files_dir, pth)
+        if index:
+            index, index_path = resolve_relative_file(files_dir, index)
+        else:
+            index, index_path = "", None
         if not pth.lower().endswith(".pth"):
             raise ValueError("invalid_extension_pth")
         if index and not index.lower().endswith(".index"):
             raise ValueError("invalid_extension_index")
-        if not (files_dir / pth).exists():
+        if not pth_path.is_file():
             raise FileNotFoundError("file_not_found_pth")
-        if index and not (files_dir / index).exists():
+        if index_path is not None and not index_path.is_file():
             raise FileNotFoundError("file_not_found_index")
 
         model_id = str(uuid.uuid4())
-        model = {"id": model_id, "name": name, "pth": pth, "index": index}
+        try:
+            speaker_id = max(0, int(speaker_id))
+        except (TypeError, ValueError):
+            raise ValueError("invalid_speaker_id")
+        model = {"id": model_id, "name": name, "pth": pth, "index": index, "speaker_id": speaker_id}
         models = self._voice.get("models") if isinstance(self._voice.get("models"), list) else []
         models = [m for m in models if isinstance(m, dict)]
         models.append(model)
@@ -253,7 +273,7 @@ class ModelRegistry:
 
     @_synchronized
     def remove_file_references(self, *, filename: str) -> dict:
-        filename = _safe_basename(filename)
+        filename = sanitize_relative_path(filename)
         changed = False
         for slot, state in list(self._slots.items()):
             if not isinstance(state, dict):
@@ -295,8 +315,8 @@ class ModelRegistry:
 
     @_synchronized
     def rename_file_references(self, *, old_name: str, new_name: str) -> dict:
-        old_name = _safe_basename(old_name)
-        new_name = _safe_basename(new_name)
+        old_name = sanitize_relative_path(old_name)
+        new_name = sanitize_relative_path(new_name)
         if old_name.lower() == new_name.lower():
             return {"changed": False}
 

@@ -82,9 +82,10 @@ class TorchGate(torch.nn.Module):
         return filt
 
     @torch.no_grad()
-    def _stationary_mask(self, X_db: torch.Tensor) -> torch.Tensor:
-        mean = X_db.mean(dim=2, keepdim=True)
-        std = X_db.std(dim=2, keepdim=True)
+    def _stationary_mask(self, X_db: torch.Tensor, noise_db: torch.Tensor | None = None) -> torch.Tensor:
+        reference = X_db if noise_db is None else noise_db
+        mean = reference.mean(dim=2, keepdim=True)
+        std = reference.std(dim=2, keepdim=True)
         thresh = mean + std * float(self.n_std_thresh_stationary)
         return X_db > thresh
 
@@ -100,7 +101,7 @@ class TorchGate(torch.nn.Module):
         return _temperature_sigmoid(ratio, float(self.n_thresh_nonstationary), float(self.temp_coeff_nonstationary))
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, noise_reference: torch.Tensor | None = None) -> torch.Tensor:
         if x.numel() == 0:
             return x
         if x.dim() == 1:
@@ -124,7 +125,24 @@ class TorchGate(torch.nn.Module):
         if self.nonstationary:
             sig_mask = self._nonstationary_mask(X.abs())
         else:
-            sig_mask = self._stationary_mask(_amp_to_db(X))
+            noise_db = None
+            if noise_reference is not None:
+                if noise_reference.dim() == 1:
+                    noise_reference = noise_reference.unsqueeze(0)
+                if noise_reference.dim() != 2:
+                    raise ValueError("noise_reference must have shape (B, T) or (T,)")
+                noise_stft = torch.stft(
+                    noise_reference.float(),
+                    n_fft=self.n_fft,
+                    hop_length=self.hop_length,
+                    win_length=self.win_length,
+                    center=True,
+                    pad_mode="constant",
+                    window=win,
+                    return_complex=True,
+                )
+                noise_db = _amp_to_db(noise_stft.to(dtype=torch.complex64))
+            sig_mask = self._stationary_mask(_amp_to_db(X), noise_db)
 
         sig_mask = float(self.prop_decrease) * (sig_mask.to(dtype=torch.float32) - 1.0) + 1.0
         if self.smoothing_filter is not None:

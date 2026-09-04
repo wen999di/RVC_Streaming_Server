@@ -10,6 +10,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from cuda_graph_runtime import clear as clear_cuda_graphs
+from cuda_graph_runtime import run as run_cuda_graph
+from cuda_graph_runtime import stats as cuda_graph_stats
+
 
 def _resample_units(wav_bt: torch.Tensor, orig_units: int, new_units: int) -> torch.Tensor:
     if orig_units == new_units:
@@ -29,6 +33,8 @@ class LoadedModelInfo:
     tgt_sr: int
     if_f0: int
     version: str
+    n_spk: int = 1
+    speaker_info: tuple = ()
  
  
 def _file_identity(path: str) -> tuple[str, int, int]:
@@ -73,7 +79,9 @@ def _load_rmvpe(device: torch.device, is_half: bool, rmvpe_path: str):
         _RMVPE_CACHE[key] = instance
         _RMVPE_CACHE.move_to_end(key)
         while len(_RMVPE_CACHE) > _BASE_MODEL_CACHE_MAX:
-            _RMVPE_CACHE.popitem(last=False)
+            _, evicted = _RMVPE_CACHE.popitem(last=False)
+            clear_cuda_graphs(getattr(evicted, "mel_extractor", None))
+            clear_cuda_graphs(getattr(evicted, "model", None))
         return instance
 
 
@@ -101,7 +109,12 @@ def _load_hubert(device: torch.device, is_half: bool, hubert_path: str) -> torch
         _HUBERT_CACHE[key] = hubert
         _HUBERT_CACHE.move_to_end(key)
         while len(_HUBERT_CACHE) > _BASE_MODEL_CACHE_MAX:
-            _HUBERT_CACHE.popitem(last=False)
+            _, evicted = _HUBERT_CACHE.popitem(last=False)
+            clear_cuda_graphs(evicted)
+            try:
+                evicted.to("cpu")
+            except Exception:
+                pass
         return hubert
 
 
@@ -162,6 +175,7 @@ class RealtimeRVCInferer:
  
         self.f0_up_key: int = 0
         self.formant_shift: float = 0.0
+        self.speaker_id: int = 0
  
         self._f0_min = 50.0
         self._f0_max = 1100.0
@@ -222,9 +236,15 @@ class RealtimeRVCInferer:
         formant_shift: float = 0.0,
         hubert_path: str = "",
         rmvpe_path: str = "",
+        speaker_id: int = 0,
     ) -> bool:
         self.f0_up_key = int(f0_up_key or 0)
         self.formant_shift = float(formant_shift or 0.0)
+        requested_speaker = max(0, int(speaker_id or 0))
+        speaker_changed = requested_speaker != self.speaker_id
+        self.speaker_id = requested_speaker
+        if speaker_changed:
+            self.reset_stream_state()
 
         model_path = str(model_path or "")
         index_path = str(index_path or "")
@@ -273,7 +293,7 @@ class RealtimeRVCInferer:
             self._faiss_resource = None
         self._index_rate = index_rate
 
-        return bool(model_asset_changed or hubert_asset_changed or rmvpe_asset_changed or index_asset_changed)
+        return bool(model_asset_changed or hubert_asset_changed or rmvpe_asset_changed or index_asset_changed or speaker_changed)
 
     def prepare(self, f0method: str = "rmvpe") -> LoadedModelInfo:
         with _device_infer_lock(self.device):
@@ -415,16 +435,13 @@ class RealtimeRVCInferer:
         return {"loaded_paths": self.get_loaded_model_paths(), "evicted_paths": evicted_paths}
 
     def _ensure_hubert_loaded(self) -> None:
+        if not self._hubert_path:
+            raise RuntimeError("未配置 HuBERT Base 模型槽位")
+
         if self._hubert is not None:
             return
 
         hubert_path = self._hubert_path
-        if not hubert_path:
-            files_dir = Path(__file__).parent / "files"
-            alt_hubert = files_dir / "hubert_base.pt"
-            if alt_hubert.exists():
-                hubert_path = str(alt_hubert)
-
         if not os.path.exists(hubert_path):
             if self._hubert_path and not os.path.isabs(self._hubert_path):
                 files_dir = Path(__file__).parent / "files"
@@ -486,6 +503,7 @@ class RealtimeRVCInferer:
             victim_net = entry.get("net")
             try:
                 if victim_net is not None:
+                    clear_cuda_graphs(victim_net)
                     victim_net.to("cpu")
             except Exception:
                 pass
@@ -531,6 +549,8 @@ class RealtimeRVCInferer:
         else:
             raise RuntimeError(f"未知模型版本: {version}")
 
+        n_spk = int(cpt["weight"]["emb_g.weight"].shape[0])
+        raw_speaker_info = list(cpt.get("speaker_info", []))
         del net_g.enc_q
         net_g.load_state_dict(cpt["weight"], strict=False)
         del cpt
@@ -538,7 +558,27 @@ class RealtimeRVCInferer:
         net_g = net_g.half() if self.is_half else net_g.float()
         net_g.eval()
 
-        info = LoadedModelInfo(tgt_sr=tgt_sr, if_f0=if_f0, version=version)
+        normalized_speakers = []
+        seen = set()
+        for item in raw_speaker_info:
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_id = int(item.get("id"))
+                item_name = str(item.get("name") or "").strip()
+            except (TypeError, ValueError):
+                continue
+            if 0 <= item_id < n_spk and item_name and item_id not in seen:
+                normalized_speakers.append((item_id, item_name))
+                seen.add(item_id)
+        normalized_speakers.sort()
+        info = LoadedModelInfo(
+            tgt_sr=tgt_sr,
+            if_f0=if_f0,
+            version=version,
+            n_spk=n_spk,
+            speaker_info=tuple(normalized_speakers),
+        )
         return net_g, info
 
     def _get_f0_post(self, f0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -563,16 +603,13 @@ class RealtimeRVCInferer:
         return self._get_f0_post(f0)
 
     def _ensure_rmvpe_loaded(self) -> None:
+        if not self._rmvpe_path:
+            raise RuntimeError("未配置 RMVPE 模型槽位")
+
         if self._rmvpe is not None:
             return
 
         rmvpe_path = self._rmvpe_path
-        if not rmvpe_path:
-            files_dir = Path(__file__).parent / "files"
-            alt_rmvpe = files_dir / "rmvpe.pt"
-            if alt_rmvpe.exists():
-                rmvpe_path = str(alt_rmvpe)
-
         if not os.path.exists(rmvpe_path):
             # Try finding in files if only filename given
             if self._rmvpe_path and not os.path.isabs(self._rmvpe_path):
@@ -640,17 +677,31 @@ class RealtimeRVCInferer:
         assert self._hubert is not None
         assert self._net_g is not None
         assert self._info is not None
+
+        if self.speaker_id >= int(self._info.n_spk):
+            raise ValueError(
+                f"说话人 ID {self.speaker_id} 超出模型范围 0..{int(self._info.n_spk) - 1}"
+            )
  
         input_wav_16k = input_wav_16k.to(self.device, dtype=torch.float16 if self.is_half else torch.float32)
         feats_in = input_wav_16k.view(1, -1)
-        padding_mask = torch.zeros_like(feats_in, dtype=torch.bool, device=self.device)
         output_layer = 9 if self._info.version == "v1" else 12
-        logits = self._hubert.extract_features(
-            source=feats_in,
-            padding_mask=padding_mask,
-            output_layer=output_layer,
+        version = self._info.version
+
+        def extract_features(source):
+            features = self._hubert.extract_features(
+                source=source,
+                padding_mask=None,
+                output_layer=output_layer,
+            )[0]
+            return self._hubert.final_proj(features) if version == "v1" else features
+
+        feats = run_cuda_graph(
+            self._hubert,
+            f"hubert-{version}",
+            extract_features,
+            feats_in,
         )
-        feats = self._hubert.final_proj(logits[0]) if self._info.version == "v1" else logits[0]
         feats = torch.cat((feats, feats[:, -1:, :]), 1)
  
         if self._faiss_index is not None and self._faiss_big_npy is not None and self._index_rate > 0.0:
@@ -730,31 +781,43 @@ class RealtimeRVCInferer:
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2.0, mode="nearest").permute(0, 2, 1)
         feats = feats[:, :p_len_int, :]
         p_len = torch.LongTensor([p_len_int]).to(self.device)
-        sid = torch.LongTensor([0]).to(self.device)
-        skip_head_t = torch.LongTensor([int(skip_head)]).to(self.device)
-        return_length_t = torch.LongTensor([int(return_length)]).to(self.device)
-        return_length2_t = torch.LongTensor([int(return_length2_int)]).to(self.device)
- 
+        sid = torch.LongTensor([self.speaker_id]).to(self.device)
         with torch.no_grad():
             if int(self._info.if_f0) == 1:
-                infered_audio, _, _ = self._net_g.infer(
+                infered_audio = run_cuda_graph(
+                    self._net_g,
+                    f"synth-f0-{int(skip_head)}-{int(return_length)}-{return_length2_int}",
+                    lambda phone, phone_length, coarse, continuous, speaker: self._net_g.infer(
+                        phone,
+                        phone_length,
+                        coarse,
+                        continuous,
+                        speaker,
+                        int(skip_head),
+                        int(return_length),
+                        return_length2_int,
+                    )[0],
                     feats,
                     p_len,
                     cache_pitch,
                     cache_pitchf,
                     sid,
-                    skip_head_t,
-                    return_length_t,
-                    return_length2_t,
                 )
             else:
-                infered_audio, _, _ = self._net_g.infer(
+                infered_audio = run_cuda_graph(
+                    self._net_g,
+                    f"synth-no-f0-{int(skip_head)}-{int(return_length)}-{return_length2_int}",
+                    lambda phone, phone_length, speaker: self._net_g.infer(
+                        phone,
+                        phone_length,
+                        speaker,
+                        int(skip_head),
+                        int(return_length),
+                        return_length2_int,
+                    )[0],
                     feats,
                     p_len,
                     sid,
-                    skip_head_t,
-                    return_length_t,
-                    return_length2_t,
                 )
  
         infered_audio = infered_audio.squeeze(1).float()
@@ -769,3 +832,13 @@ class RealtimeRVCInferer:
             infered_audio = _resample_units(infered_audio, upp_units, base_units)
  
         return infered_audio.squeeze()
+
+    def cuda_graph_status(self) -> dict:
+        status = {
+            "hubert": cuda_graph_stats(self._hubert) if self._hubert is not None else {},
+            "synthesizer": cuda_graph_stats(self._net_g) if self._net_g is not None else {},
+        }
+        if self._rmvpe is not None:
+            status["rmvpe_mel"] = cuda_graph_stats(self._rmvpe.mel_extractor)
+            status["rmvpe_network"] = cuda_graph_stats(self._rmvpe.model)
+        return status

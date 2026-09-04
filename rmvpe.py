@@ -8,6 +8,8 @@ from librosa.util import pad_center
 from scipy.signal import get_window
 import logging
 
+from cuda_graph_runtime import run as run_cuda_graph
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -493,7 +495,12 @@ class RMVPE:
                 hidden = torch.from_numpy(hidden).to(self.device)
             else:
                 mel = mel.half() if self.is_half else mel.float()
-                hidden = self.model(mel)
+                hidden = run_cuda_graph(
+                    self.model,
+                    "rmvpe-network",
+                    lambda input_mel: self.model(input_mel),
+                    mel,
+                )
             return hidden[:, :n_frames]
 
     def decode(self, hidden, thred=0.03):
@@ -505,8 +512,12 @@ class RMVPE:
     def infer_from_audio(self, audio, thred=0.03):
         if not torch.is_tensor(audio):
             audio = torch.from_numpy(audio)
-        mel = self.mel_extractor(
-            audio.float().to(self.device).unsqueeze(0), center=True
+        audio_batch = audio.float().to(self.device).unsqueeze(0)
+        mel = run_cuda_graph(
+            self.mel_extractor,
+            "rmvpe-mel-centered",
+            lambda input_audio: self.mel_extractor(input_audio, center=True),
+            audio_batch,
         )
         hidden = self.mel2hidden(mel)
         if "privateuseone" not in str(self.device):
