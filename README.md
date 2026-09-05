@@ -17,6 +17,56 @@ pixi run start
 
 Default endpoint: `ws://127.0.0.1:8765`.
 
+## Dependency download sources
+
+Use Pixi 0.73.0 or newer. The checked-in `.pixi/config.toml` enables China
+mirrors automatically for both the `default` and `pymss` environments, including
+`pixi install --locked` and dependency installation from the desktop client.
+
+| Packages | China (default) | Global |
+| --- | --- | --- |
+| Conda / conda-forge | Tsinghua TUNA | conda.anaconda.org |
+| PyPI, including NVIDIA CUDA dependencies | Aliyun | pypi.org / files.pythonhosted.org |
+| PyTorch / torchaudio CUDA 12.8 | Shanghai Jiao Tong SJTUG | download.pytorch.org / download-r2.pytorch.org |
+
+Switch from the server directory before running any Pixi install/run command.
+No Python environment or dependency download is needed to switch.
+
+Windows PowerShell:
+
+```powershell
+Copy-Item config/pixi-global.toml .pixi/config.toml  # Global
+Copy-Item config/pixi-cn.toml .pixi/config.toml      # China (default)
+```
+
+Linux / macOS shell:
+
+```bash
+cp config/pixi-global.toml .pixi/config.toml  # Global
+cp config/pixi-cn.toml .pixi/config.toml      # China (default)
+```
+
+Run only the line for the desired profile. Then install as usual:
+
+```bash
+pixi install --locked
+pixi install --locked -e pymss
+```
+
+These commands replace the project-local `.pixi/config.toml`; keep any custom
+settings in a separate user-level Pixi configuration, or reapply them after
+switching. Inspect the active routing with `pixi config list --local mirrors`.
+The switch persists for this checkout and does not change machine-wide settings.
+
+Pixi's native `mirrors` routing covers both index requests and actual package
+URLs, including the PyTorch `download-r2` host and PyPI wheel downloads. The
+source URLs in `pixi.toml` and `pixi.lock` remain stable; seeing an upstream URL
+there does not mean the download bypasses the mirror. Switching profiles keeps
+the same package versions and hashes and does not require regenerating the lock
+file. The China profile has no upstream fallback; switch to global if a mirror
+has not synchronized a required package. Model/checkpoint downloads at runtime
+are managed separately and are not affected by these dependency profiles.
+
 ## Private local process mode
 
 The desktop client can start an installed server directly from its connection panel. Select **本地** and open **设置**. **从 GitHub 下载** retrieves the `master` branch source archive without Git history, while **下载依赖** runs `pixi install --environment default --locked` and streams its output in the settings window. Choose an existing installation or complete those two steps, run **检查依赖**, save, and use **启动并连接**. The default directory is `localServer` beside the client executable. The directory must contain `server.py`, `pixi.toml`, and an installed `.pixi/envs/default` environment. The separate dependency check uses `--no-install --frozen`; it does not install packages or update `pixi.lock`.

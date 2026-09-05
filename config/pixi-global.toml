@@ -1,0 +1,13 @@
+# Global download profile. Self-mappings override matching user-level mirrors.
+[mirrors]
+"https://conda.anaconda.org/conda-forge" = ["https://conda.anaconda.org/conda-forge"]
+"https://pypi.org/simple" = ["https://pypi.org/simple"]
+"https://files.pythonhosted.org/packages" = ["https://files.pythonhosted.org/packages"]
+"https://mirrors.aliyun.com/pypi/simple" = ["https://pypi.org/simple"]
+"https://mirrors.aliyun.com/pypi/packages" = ["https://files.pythonhosted.org/packages"]
+"https://download.pytorch.org/whl" = ["https://download.pytorch.org/whl"]
+"https://download-r2.pytorch.org/whl" = ["https://download-r2.pytorch.org/whl"]
+# Also handle mirror URLs returned by indexes during a later lock update.
+"https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge" = ["https://conda.anaconda.org/conda-forge"]
+"https://mirrors.sjtug.sjtu.edu.cn/pytorch-wheels" = ["https://download.pytorch.org/whl"]
+"https://s3.jcloud.sjtu.edu.cn/899a892efef34b1b944a19981040f55b-oss01/pytorch-wheels" = ["https://download.pytorch.org/whl"]

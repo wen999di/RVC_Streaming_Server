@@ -1,6 +1,8 @@
 [workspace]
 name = "RVC"
 version = "0.1.0"
+# Download routing is configured in .pixi/config.toml (China by default).
+# See README.md to switch between China and global without changing the lock.
 channels = ["conda-forge"]
 platforms = ["linux-64", "win-64"]
 channel-priority = "disabled"

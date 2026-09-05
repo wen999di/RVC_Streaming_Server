@@ -1,0 +1,10 @@
+# China download profile. Restore from config/pixi-cn.toml after local changes.
+# Mirrors apply to both dependency resolution and locked package downloads.
+[mirrors]
+"https://conda.anaconda.org/conda-forge" = ["https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"]
+"https://pypi.org/simple" = ["https://mirrors.aliyun.com/pypi/simple"]
+"https://files.pythonhosted.org/packages" = ["https://mirrors.aliyun.com/pypi/packages"]
+"https://mirrors.aliyun.com/pypi/simple" = ["https://mirrors.aliyun.com/pypi/simple"]
+"https://mirrors.aliyun.com/pypi/packages" = ["https://mirrors.aliyun.com/pypi/packages"]
+"https://download.pytorch.org/whl" = ["https://mirrors.sjtug.sjtu.edu.cn/pytorch-wheels"]
+"https://download-r2.pytorch.org/whl" = ["https://mirrors.sjtug.sjtu.edu.cn/pytorch-wheels"]
